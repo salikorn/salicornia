@@ -1,4 +1,11 @@
 // unit: fp16 / bf16 / fp8-e4m3 conversions (exhaustive round-trips + known values + 10M random)
+/// \file
+/// \brief Exhaustive tests for the xlab/fp16.hpp conversions.
+///
+/// Coverage strategy per format: every bit pattern where the domain fits in a loop
+/// (all 65536 fp16 and bf16 patterns, all 256 fp8-e4m3 patterns), known bit patterns
+/// for specials (zero, Inf, NaN, max/min subnormal), and a 10M-sample random bound
+/// for the only lossy direction (f32->f16, half-ulp 2^-11 relative on normals).
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -108,4 +115,7 @@ XLAB_TEST("fp8 e4m3 exhaustive range + known values") {
     CHECK_MSG(nans == 2, ("nan count " + std::to_string(nans)).c_str());  // 0x7F, 0xFF
 }
 
+/// \brief Entry point: runs the "fp16" suite (JSONL events under runs/). The 10M-sample
+///        random test is the slow one; everything else is exhaustive-but-instant.
+/// \return 0 iff all tests passed (CTest-compatible).
 int main() { return xlab::test::run_all("fp16"); }

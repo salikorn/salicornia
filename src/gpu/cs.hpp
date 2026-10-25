@@ -1,108 +1,98 @@
-// salikorn / gpu — minimal Direct3D 12 compute backend (raw compute shaders).
-// Proven on the Intel UHD (spike_d3d12): runtime HLSL compile via d3dcompiler_47 (SM5.1),
-// root-descriptor binding, explicit transitions. Constraint: keep a single dispatch under
-// ~2 s (TDR); use the chunked helpers.
+/** \file
+ *  \brief salikorn / gpu — minimal Direct3D 12 compute backend (raw compute shaders).
+ *
+ * Proven on the Intel UHD (spike_d3d12): runtime HLSL compile via d3dcompiler_47 (SM5.1),
+ * root-descriptor binding, explicit transitions. Constraint: keep a single dispatch under
+ * ~2 s (TDR — Timeout Detection & Recovery kills the device if a GPU call stalls longer);
+ * use the chunked helpers.
+ *
+ * Declarations only; implementations live in cs.cpp (nothing here is a template).
+ */
 #pragma once
 
 #include <d3d12.h>
-#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <cstdint>
-#include <cstring>
-#include <filesystem>
 #include <map>
-#include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace sal::gpu {
 
 using Microsoft::WRL::ComPtr;
 
-inline void check(HRESULT hr, const char* what) {
-    if (FAILED(hr)) {
-        char b[64];
-        std::snprintf(b, sizeof b, "0x%08X", (unsigned)hr);
-        throw std::runtime_error(std::string(what) + " failed: " + b);
-    }
-}
+/// \brief Throws std::runtime_error("<what> failed: 0x........") when `hr` is a
+///        failure code; returns without effect on success.
+void check(HRESULT hr, const char* what);
 
+/** \brief Owning D3D12 device context: one adapter/device plus a single reusable
+ *         compute command queue, allocator, command list and fence.
+ *
+ * Resource-state discipline: the Device does no state tracking. transition()
+ * records exactly the StateBefore/StateAfter pair the caller passes, so the
+ * caller must know each buffer's current state. The convention throughout this
+ * backend (Buffer, Kernel::dispatch, kernels.hpp kernel sets) is:
+ * - buffers rest in D3D12_RESOURCE_STATE_COMMON between operations;
+ * - each op transitions its inputs COMMON -> NON_PIXEL_SHADER_RESOURCE and its
+ *   output COMMON -> UNORDERED_ACCESS before Dispatch, and back after;
+ * - when one resource occupies two slots of a dispatch (e.g. in-place
+ *   elementwise), only one transition is recorded per edge.
+ *
+ * Command recording model: one command allocator / one command list, reused
+ * round-robin via begin() ... submit_and_wait(); there is never more than one
+ * batch in flight (submit_and_wait blocks until the GPU fence is signalled).
+ */
 class Device {
   public:
-    void init(bool force_warp = false) {
-        check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "CreateDXGIFactory2");
-        if (force_warp) {
-            ComPtr<IDXGIFactory4> f4;
-            check(factory_.As(&f4), "QI factory4");
-            check(f4->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)), "EnumWarpAdapter");
-            adapter_->GetDesc1(&adesc_);
-            warp_ = true;
-        } else {
-            ComPtr<IDXGIAdapter1> a;
-            for (UINT i = 0; factory_->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
-                DXGI_ADAPTER_DESC1 d;
-                a->GetDesc1(&d);
-                if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-                    adapter_ = a;
-                    adesc_ = d;
-                    break;
-                }
-            }
-            if (!adapter_) return init(true);
-        }
-        HRESULT hr = D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev_));
-        if (FAILED(hr))
-            check(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)),
-                  "D3D12CreateDevice(11_0)");
-        D3D12_COMMAND_QUEUE_DESC qd{};
-        qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-        check(dev_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
-        check(dev_->CreateCommandAllocator(qd.Type, IID_PPV_ARGS(&alloc_)), "CreateCommandAllocator");
-        check(dev_->CreateCommandList(0, qd.Type, alloc_.Get(), nullptr, IID_PPV_ARGS(&list_)),
-              "CreateCommandList");
-        check(list_->Close(), "Close(new list)");
-        check(dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
-        fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        if (!fence_event_) throw std::runtime_error("CreateEvent");
-    }
+    /** \brief Create the factory, pick an adapter, create the device, and set up
+     *         the compute queue / allocator / (closed) command list / fence.
+     * \param force_warp  when true, use the Microsoft WARP software adapter
+     *                    directly instead of enumerating hardware.
+     *
+     * Adapter selection: enumerate adapters, take the first whose
+     * DXGI_ADAPTER_FLAG_SOFTWARE flag is clear; if none exists, fall back to
+     * init(true) (WARP). Device creation tries feature level 12.0 and falls
+     * back to 11.0. The command list is created in the recording state and
+     * immediately Closed, ready for begin(). Throws std::runtime_error on any
+     * failed D3D call (via check()).
+     */
+    void init(bool force_warp = false);
 
-    ID3D12Device* dev() { return dev_.Get(); }
-    bool warp() const { return warp_; }
-    std::string adapter_name() const { return {adesc_.Description, adesc_.Description + std::wcslen(adesc_.Description)}; }
+    /// \brief Non-owning pointer to the underlying ID3D12Device (null before init()).
+    ID3D12Device* dev();
+    /// \brief True when the selected adapter is WARP (software rendering).
+    bool warp() const;
+    /// \brief Description string of the selected adapter (from DXGI_ADAPTER_DESC1).
+    std::string adapter_name() const;
 
-    void begin() {
-        check(alloc_->Reset(), "alloc reset");
-        check(list_->Reset(alloc_.Get(), nullptr), "list reset");
-    }
-    void submit_and_wait() {
-        check(list_->Close(), "close");
-        ID3D12CommandList* ls[] = {list_.Get()};
-        queue_->ExecuteCommandLists(1, ls);
-        check(queue_->Signal(fence_.Get(), ++fence_value_), "Signal");
-        check(fence_->SetEventOnCompletion(fence_value_, fence_event_), "SetEventOnCompletion");
-        DWORD w = WaitForSingleObject(fence_event_, 120000);
-        if (w != WAIT_OBJECT_0) throw std::runtime_error("GPU fence wait failed/timeout");
-        HRESULT rr = dev_->GetDeviceRemovedReason();
-        if (FAILED(rr)) throw std::runtime_error("device removed during compute");
-    }
-    void transition(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = r;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = before;
-        b.Transition.StateAfter = after;
-        list_->ResourceBarrier(1, &b);
-    }
-    void uav_barrier(ID3D12Resource* r) {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        b.UAV.pResource = r;
-        list_->ResourceBarrier(1, &b);
-    }
-    ID3D12GraphicsCommandList* list() { return list_.Get(); }
+    /// \brief Reset the command allocator and command list to start recording a
+    ///        new batch. The previous batch must already have been submitted.
+    void begin();
+    /** \brief Close the command list, execute it on the compute queue and block
+     *         until completion.
+     *
+     * Signals the fence, waits on the fence event (hard 120 s timeout, beyond
+     * any single dispatch's ~2 s TDR budget), then checks
+     * GetDeviceRemovedReason() and throws if the device was removed mid-batch.
+     */
+    void submit_and_wait();
+    /** \brief Record a transition resource barrier over all subresources.
+     *
+     * \param r       resource to transition (must not be null).
+     * \param before  state the resource is currently in (caller-tracked).
+     * \param after   state to move it into.
+     * \note No validation: passing a `before` that does not match reality makes
+     *       the debug layer complain and can produce undefined behavior.
+     */
+    void transition(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
+    /// \brief Record a UAV barrier on `r` (nullptr barriers flush everything);
+    ///        required between two dispatches when one writes what the next reads
+    ///        via the UAV.
+    void uav_barrier(ID3D12Resource* r);
+    /// \brief The open/closed command list used by begin()/submit_and_wait(); also
+    ///        exposed for callers recording extra commands (e.g. CopyBufferRegion).
+    ID3D12GraphicsCommandList* list();
 
   private:
     friend class Buffer;
@@ -119,73 +109,51 @@ class Device {
     bool warp_ = false;
 };
 
-enum class BufferKind { SrcRead, Uav, CpuWrite, Readback };
+/// \brief Heap/state profile of a Buffer.
+enum class BufferKind {
+    SrcRead,   ///< default heap, bound as SRV (t*) only; rests in COMMON
+    Uav,       ///< default heap with D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; bound as u*
+    CpuWrite,  ///< upload heap (GENERIC_READ); mappable for direct CPU writes
+    Readback   ///< readback heap (COPY_DEST); mappable for CPU reads of GPU results
+};
 
+/** \brief Committed D3D12 buffer of a fixed size, classified by BufferKind.
+ *
+ * \note Only `Uav` buffers carry D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, so
+ *       only they can be bound at the u0 slot of a Kernel; SRV binding works for
+ *       default-heap buffers regardless of the flag. Upload/download of
+ *       non-CpuWrite/Readback buffers goes through a temporary staging buffer
+ *       and a synchronous device copy (see upload()/download()).
+ */
 class Buffer {
   public:
-    Buffer(Device& d, uint64_t size, BufferKind kind) : dev_(&d), size_(size), kind_(kind) {
-        D3D12_HEAP_TYPE ht;
-        D3D12_RESOURCE_STATES init;
-        bool uav = false;
-        switch (kind) {
-            case BufferKind::SrcRead: ht = D3D12_HEAP_TYPE_DEFAULT; init = D3D12_RESOURCE_STATE_COMMON; break;
-            case BufferKind::Uav: ht = D3D12_HEAP_TYPE_DEFAULT; init = D3D12_RESOURCE_STATE_COMMON; uav = true; break;
-            case BufferKind::CpuWrite: ht = D3D12_HEAP_TYPE_UPLOAD; init = D3D12_RESOURCE_STATE_GENERIC_READ; break;
-            case BufferKind::Readback: ht = D3D12_HEAP_TYPE_READBACK; init = D3D12_RESOURCE_STATE_COPY_DEST; break;
-        }
-        D3D12_HEAP_PROPERTIES props{ht};
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = size;
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc = {1, 0};
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        desc.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
-        check(d.dev()->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, init, nullptr,
-                                               IID_PPV_ARGS(&res_)),
-              "CreateCommittedResource");
-    }
-    uint64_t size() const { return size_; }
-    ID3D12Resource* res() { return res_.Get(); }
-    D3D12_GPU_VIRTUAL_ADDRESS gpu_addr() { return res_->GetGPUVirtualAddress(); }
+    /// \brief Create a committed resource on `d`'s device: heap type and initial
+    ///        state are chosen from `kind` (see BufferKind); size in bytes.
+    Buffer(Device& d, uint64_t size, BufferKind kind);
+    /// \brief Buffer size in bytes as passed to the constructor.
+    uint64_t size() const;
+    /// \brief Underlying ID3D12Resource (for transitions / copy commands).
+    ID3D12Resource* res();
+    /// \brief GPU virtual address used for root-descriptor (SRV/UAV) binding.
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_addr();
 
-    // CPU-side staging copy (uploads/downloads go via CopyBufferRegion on the device queue)
-    void upload(const void* data, uint64_t bytes, uint64_t dst_offset = 0) {
-        if (kind_ == BufferKind::CpuWrite) {
-            void* p = nullptr;
-            D3D12_RANGE none{0, 0};
-            check(res_->Map(0, &none, &p), "Map(upload)");
-            std::memcpy(reinterpret_cast<uint8_t*>(p) + dst_offset, data, size_t(bytes));
-            res_->Unmap(0, nullptr);
-        } else {
-            Buffer staging(*dev_, bytes, BufferKind::CpuWrite);
-            staging.upload(data, bytes, 0);
-            dev_->begin();
-            dev_->transition(res_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-            dev_->list()->CopyBufferRegion(res_.Get(), dst_offset, staging.res(), 0, bytes);
-            dev_->transition(res_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-            dev_->submit_and_wait();
-        }
-    }
-    void download(void* data, uint64_t bytes, uint64_t src_offset = 0) {
-        Buffer staging(*dev_, bytes, BufferKind::Readback);
-        dev_->begin();
-        dev_->transition(res_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        dev_->list()->CopyBufferRegion(staging.res(), 0, res_.Get(), src_offset, bytes);
-        dev_->transition(res_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-        dev_->submit_and_wait();
-        staging.map_read(data, bytes);
-    }
-    void map_read(void* data, uint64_t bytes) {
-        void* p = nullptr;
-        D3D12_RANGE rd{0, static_cast<SIZE_T>(bytes)};
-        check(res_->Map(0, &rd, &p), "Map(read)");
-        std::memcpy(data, p, size_t(bytes));
-        D3D12_RANGE wr{0, 0};
-        res_->Unmap(0, &wr);
-    }
+    /** \brief Copy `bytes` from CPU memory into the buffer at `dst_offset`.
+     *
+     * CpuWrite buffers: mapped write, no GPU involvement. Everything else:
+     * creates a temporary CpuWrite staging buffer and issues a CopyBufferRegion
+     * on the device queue (COMMON -> COPY_DEST -> COMMON transitions, then a
+     * synchronous submit_and_wait()).
+     */
+    void upload(const void* data, uint64_t bytes, uint64_t dst_offset = 0);
+    /** \brief Copy `bytes` from the buffer at `src_offset` into CPU memory.
+     *
+     * Always goes through a temporary Readback staging buffer and a synchronous
+     * device copy (COMMON -> COPY_SOURCE -> COMMON transitions).
+     */
+    void download(void* data, uint64_t bytes, uint64_t src_offset = 0);
+    /// \brief Map this (Readback) buffer and memcpy `bytes` into `data`.
+    ///        Only meaningful on Readback/CpuWrite heaps.
+    void map_read(void* data, uint64_t bytes);
 
   private:
     Device* dev_;
@@ -194,92 +162,62 @@ class Buffer {
     BufferKind kind_;
 };
 
-// A compute shader: HLSL compiled at runtime; expects root signature
-// [0]=SRV t0, [1]=SRV t1, [2]=UAV u0, [3]=32-bit constants b0 (max 8).
-inline std::string substitute_tokens(
-    const std::string& tmpl, const std::map<std::string, std::string>& defines) {
-    std::string out = tmpl;
-    for (const auto& [k, v] : defines) {
-        std::string tok = "@" + k + "@";
-        for (size_t pos; (pos = out.find(tok)) != std::string::npos;)
-            out.replace(pos, tok.size(), v);
-    }
-    if (out.find('@') != std::string::npos)
-        throw std::runtime_error("unresolved @token@ in shader template");
-    return out;
-}
+/** \brief Replace `&#64;NAME&#64;` tokens in a shader template from the defines map.
+ *
+ * \param tmpl     raw template text containing `&#64;TOKEN&#64;` placeholders.
+ * \param defines  token name (without '@') -> replacement text, applied in map
+ *                 (alphabetical) order.
+ * \return Fully substituted source.
+ * \throws std::runtime_error if any '@' remains after substitution — a hard
+ *         error that catches typos in both templates and define maps.
+ */
+std::string substitute_tokens(const std::string& tmpl, const std::map<std::string, std::string>& defines);
 
+/** \brief A compute shader: HLSL compiled at runtime into a root signature + PSO pair.
+ *
+ * The root signature is fixed for all kernels:
+ * `[0]=SRV t0, [1]=SRV t1, [2]=UAV u0, [3]=32-bit constants b0 (max 8 words)`.
+ * Shaders see the constants as cbuffer KC with `uint4 p` (words 0-3) and
+ * `uint4 q` (words 4-7); per-kernel meanings are documented next to each
+ * template in kernels.inl.
+ *
+ * Compilation loads d3dcompiler_47.dll dynamically and calls its D3DCompile
+ * (target cs_5_1 by default); compile errors surface the compiler's own
+ * diagnostic text in the thrown std::runtime_error.
+ */
 class Kernel {
   public:
+    /// \brief Compile plain HLSL (no token substitution).
     Kernel(Device& d, const char* hlsl, const char* entry = "cs_main",
-           const char* target = "cs_5_1")
-        : Kernel(d, hlsl, {}, entry, target) {}
+           const char* target = "cs_5_1");
 
-    // Template form: @TOKEN@ occurrences are replaced from `defines` before compilation;
-    // a leftover '@' after substitution is a hard error (catches typos in templates).
+    /// \brief Compile a template: &#64;TOKEN&#64; occurrences are replaced from `defines`
+    ///        (via substitute_tokens) before compilation; a leftover '@' after
+    ///        substitution is a hard error (catches typos in templates).
     Kernel(Device& d, const char* hlsl_template,
            const std::map<std::string, std::string>& defines, const char* entry = "cs_main",
-           const char* target = "cs_5_1") {
-        std::string src = substitute_tokens(hlsl_template, defines);
-        const char* hlsl = src.c_str();
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-        if (!dc) throw std::runtime_error("d3dcompiler_47.dll not found");
-        using Fn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
-                                    LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-        auto fn = (Fn)GetProcAddress(dc, "D3DCompile");
-        if (!fn) throw std::runtime_error("D3DCompile not exported");
-        ComPtr<ID3DBlob> code, errs;
-        HRESULT hr = fn(hlsl, std::strlen(hlsl), nullptr, nullptr, nullptr, entry, target, 0, 0,
-                        &code, &errs);
-        if (FAILED(hr)) {
-            std::string msg = errs ? (const char*)errs->GetBufferPointer() : "no diagnostics";
-            throw std::runtime_error(std::string("D3DCompile: ") + msg);
-        }
-        D3D12_ROOT_PARAMETER rp[4]{};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rp[0].Descriptor.ShaderRegister = 0;
-        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rp[1].Descriptor.ShaderRegister = 1;
-        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        rp[2].Descriptor.ShaderRegister = 0;
-        for (int i = 0; i < 3; ++i) {
-            rp[i].Descriptor.RegisterSpace = 0;
-            rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
-        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp[3].Constants.ShaderRegister = 0;
-        rp[3].Constants.RegisterSpace = 0;
-        rp[3].Constants.Num32BitValues = 8;
-        rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 4;
-        rsd.pParameters = rp;
-        ComPtr<ID3DBlob> sig, sigerr;
-        check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sigerr),
-              "D3D12SerializeRootSignature");
-        check(d.dev()->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-                                           IID_PPV_ARGS(&rootsig_)),
-              "CreateRootSignature");
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rootsig_.Get();
-        pd.CS.pShaderBytecode = code->GetBufferPointer();
-        pd.CS.BytecodeLength = code->GetBufferSize();
-        check(d.dev()->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_)),
-              "CreateComputePipelineState");
-    }
+           const char* target = "cs_5_1");
 
-    // Records one dispatch. Caller is responsible for resource states + UAV barriers
-    // between dispatches writing the same buffer, and for keeping chunks under ~2 s.
+    /** \brief Record one dispatch of this kernel with the given bindings.
+     *
+     * Binds a at t0, b at t1, out at u0 (root descriptors, i.e. raw GPU
+     * addresses) and uploads `consts` as the eight 32-bit root constants, then
+     * Dispatch(gx, gy, gz) thread groups.
+     *
+     * \param d       device whose command list the dispatch is recorded into.
+     * \param a       buffer bound as SRV t0.
+     * \param b       buffer bound as SRV t1 (may alias `a`).
+     * \param out     buffer bound as UAV u0 (may alias an input for in-place ops).
+     * \param consts  eight 32-bit words visible in-shader as KC.p (0-3) / KC.q (4-7).
+     * \param gx,gy,gz  dispatch grid in thread groups (not threads).
+     *
+     * \note Caller responsibilities: correct resource states (see Device's
+     *       state discipline), a uav_barrier() between two dispatches where one
+     *       writes what the next reads, and keeping each dispatch chunk under
+     *       ~2 s so the TDR never fires.
+     */
     void dispatch(Device& d, Buffer& a, Buffer& b, Buffer& out, const uint32_t consts[8],
-                  uint32_t gx, uint32_t gy, uint32_t gz = 1) {
-        d.list()->SetPipelineState(pso_.Get());
-        d.list()->SetComputeRootSignature(rootsig_.Get());
-        d.list()->SetComputeRootShaderResourceView(0, a.gpu_addr());
-        d.list()->SetComputeRootShaderResourceView(1, b.gpu_addr());
-        d.list()->SetComputeRootUnorderedAccessView(2, out.gpu_addr());
-        d.list()->SetComputeRoot32BitConstants(3, 8, consts, 0);
-        d.list()->Dispatch(gx, gy, gz);
-    }
+                  uint32_t gx, uint32_t gy, uint32_t gz = 1);
 
   private:
     ComPtr<ID3D12RootSignature> rootsig_;

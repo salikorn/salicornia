@@ -9,6 +9,35 @@
 // correctness gate vs CPU reference on a small shape (mismatch/NaN => disqualified, the
 // tuner may never pick a broken variant) -> warmup + median-of-N timing on the
 // trainer-representative shape (and the analysis shape for the GEMM family, recorded).
+/// \file
+/// \brief autotune.exe — sweeps the launch-geometry candidate space on THIS machine and
+///        writes profiles/best.json for the production kernel sets to load.
+///
+/// \section gating Candidate-gating protocol (applied identically to every op)
+/// For each candidate from sal::gpu::autotune::spaces():
+///  1. <b>Compile</b> — gpu::Kernel performs runtime HLSL compilation with the
+///     candidate's \@TOKEN\@ defines. A compile failure disqualifies the candidate
+///     (caught std::exception, logged as COMPILE FAIL) but never aborts the sweep.
+///  2. <b>Correctness gate</b> — the candidate runs on a small shape against a
+///     CPU reference (GEMM: 64x48x32 with packed-buffer offsets, max diff < 2e-4;
+///     syrk: 256x64 Gram, < 2e-3; elem: n=4096 gelu vs CPU, < 1e-5; vq_nearest:
+///     argmin index match on B=8/K=256, zero mismatches). A non-finite or
+///     over-tolerance result logs \c cand_rejected and the candidate is skipped:
+///     the tuner may never pick a broken variant, no matter how fast it times.
+///  3. <b>Timing</b> — warmup packets, then median-of-reps wall clock via
+///     time_packets() on the trainer-representative shape (winner-selection metric);
+///     the GEMM family additionally records a 2048^3 "analysis shape" timing,
+///     which is informational and does not influence winner choice. Every timed
+///     candidate logs a \c cand_timed event; each op logs \c op_winner.
+/// Dispatches are wrapped in explicit COMMON -> NON_PIXEL_SHADER_RESOURCE /
+/// UNORDERED_ACCESS transitions and back (see the resource-state discipline note in
+/// tests/test_gpu.cpp); syrk additionally times one dispatch packet per output-column
+/// chunk because WDDM's TDR budget applies per submitted packet.
+///
+/// Output: a per-op winners map + accumulated TuneParams written via save_profile()
+/// (adapter name recorded), a \c profile_written event, and a summary table to stdout.
+/// adam intentionally shares the elem family's geometry: its own winner is only
+/// recorded as a note when it disagrees with the elem winner.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -28,40 +57,60 @@
 namespace gpu = sal::gpu;
 namespace at = sal::gpu::autotune;
 
+/// \brief Monotonic steady-clock timestamp in milliseconds (timing baseline).
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()
                                                          .time_since_epoch())
         .count();
 }
+/// \brief Bit-casts a float into the 8-word kernel constant block (see test_gpu.cpp).
+/// \param f Value to encode. \return Its uint32 bit pattern.
 static uint32_t f2u(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
     return u;
 }
+/// \brief Inverse of f2u().
+/// \param u uint32 bit pattern. \return Reinterpreted float.
 static float u2f(uint32_t u) {
     float f;
     std::memcpy(&f, &u, 4);
     return f;
 }
+/// \brief CPU reference GELU (tanh approximation) — correctness gate for the elem family.
+/// \param x Input value. \return 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3))).
 static float gelu(float x) {
     const float k0 = 0.7978845608f;
     return 0.5f * x * (1.0f + std::tanh(k0 * (x + 0.044715f * x * x * x)));
 }
 
 // median of a timing sample
+/// \brief Median of a timing sample.
+/// \param v Sample (copied, then sorted).
+/// \return Middle element of the sorted copy; 1e30 for an empty sample so a failed
+///         measurement can never win the argmin.
 static double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     return v.empty() ? 1e30 : v[v.size() / 2];
 }
 
+/// \brief Result of gating + timing one candidate.
 struct Timing {
-    bool gate_ok = false;
-    std::string gate_note;
-    double trainer_ms = 1e30;   // representative shape used for winner selection
-    double analysis_ms = -1.0;  // second shape, recorded for the table
+    bool gate_ok = false;       ///< True iff the correctness gate passed.
+    std::string gate_note;      ///< "max_diff=<g>" recorded with rejections/events.
+    double trainer_ms = 1e30;   ///< Representative shape used for winner selection
+    double analysis_ms = -1.0;  ///< Second shape, recorded for the table
 };
 
 // ---- generic timed-run helper: reps of [begin; record; submit] ----
+/// \brief Times a GPU operation as complete packets: \p warmup full
+///        begin/record/submit_and_wait cycles, then \p reps timed cycles, each measured
+///        wall-clock from before begin() to after submit_and_wait().
+/// \param dev    Initialized device (queue/list/fence).
+/// \param warmup Number of untimed warmup packets (shader JIT, allocator, cache state).
+/// \param reps   Number of timed packets; the returned value is the median.
+/// \param record Closure recording transitions + dispatch into the open list.
+/// \return Median per-packet wall-clock milliseconds.
 static double time_packets(gpu::Device& dev, int warmup, int reps,
                            const std::function<void()>& record) {
     for (int i = 0; i < warmup; ++i) {
@@ -81,6 +130,10 @@ static double time_packets(gpu::Device& dev, int warmup, int reps,
 }
 
 // fills a small random buffer set once
+/// \brief Fills a vector with uniform random floats in [lo, hi] from \p rng.
+/// \param n   Element count. \param rng Shared seeded generator (deterministic run).
+/// \param lo  Lower bound (default -1). \param hi Upper bound (default 1).
+/// \return The filled vector.
 static std::vector<float> randf(size_t n, std::mt19937& rng, float lo = -1.f, float hi = 1.f) {
     std::uniform_real_distribution<float> u(lo, hi);
     std::vector<float> v(n);
@@ -88,6 +141,14 @@ static std::vector<float> randf(size_t n, std::mt19937& rng, float lo = -1.f, fl
     return v;
 }
 
+/// \brief Entry point: parses flags (--quick, --reps N, --out PATH, --only op,op),
+///        initializes the device, runs the gated sweep per op family (gemm_nt/nn/tn,
+///        syrk, elem, adam, vq_nearest, vq_update — see the file-level gating
+///        protocol), accumulates winners into a TuneParams, and writes the profile
+///        via save_profile() to \c --out (default profiles/best.json). Every stage
+///        emits xlab events; any fatal error is logged as a \c "fatal" event with
+///        exit code 1.
+/// \return 0 on success, 1 on fatal error.
 int main(int argc, char** argv) {
     bool quick = false;
     int reps = 5;

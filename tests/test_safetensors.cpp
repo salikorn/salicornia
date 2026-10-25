@@ -1,4 +1,12 @@
 // unit: safetensors mmap reader (synthetic fixture + real shard header when present)
+/// \file
+/// \brief Tests for st/safetensors.hpp's mmap reader.
+///
+/// Two tiers: (1) a synthetic fixture written by write_fixture() with an odd-length
+/// header (exercises the header-size parsing) and mixed F32/BF16 tensors with exact
+/// expected bytes; (2) the real model shard-62 header, checked only when the file is
+/// present on disk (SKIP_IF otherwise) — pins the tensor count, file size, and that
+/// every mmap offset stays inside the data region.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +18,10 @@
 #include "st/safetensors.hpp"
 #include "xlab/test.hpp"
 
+/// \brief Writes a minimal two-tensor safetensors fixture to the temp directory:
+///        F32 [2,3] at offsets [0,24) and BF16 [4,2] at [24,40), with an odd-length
+///        JSON header (one trailing space) to exercise header-size handling.
+/// \return Path of the written fixture; the caller removes it after the test.
 static std::filesystem::path write_fixture() {
     auto path = std::filesystem::temp_directory_path() / "salikorn_test_fixture.safetensors";
     // header: two tensors — F32 [2,3] then BF16 [4,2] — with 16-byte-alignment padding offsets
@@ -75,4 +87,6 @@ XLAB_TEST("real shard-62 header validates") {
     for (auto& [name, t] : f.tensors()) CHECK(t.offset + t.size_bytes <= data_bytes);
 }
 
+/// \brief Entry point: runs the "safetensors" suite (JSONL events under runs/).
+/// \return 0 iff all tests passed (CTest-compatible).
 int main() { return xlab::test::run_all("safetensors"); }

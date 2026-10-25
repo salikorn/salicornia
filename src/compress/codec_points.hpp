@@ -1,4 +1,10 @@
-// salikorn / compress — bake-off result parsing shared by spikes, tests, and tools.
+/**
+ * \file codec_points.hpp
+ * \brief Bake-off result parsing shared by spikes, tests, and tools.
+ *
+ * Declares parse_codec_points() and its CodecPoint record; the implementation
+ * lives in codec_points.cpp.
+ */
 #pragma once
 
 #include <string>
@@ -6,35 +12,27 @@
 
 namespace sal {
 
+/// \brief One (codec, bits-per-weight, relative-MSE) measurement extracted from
+///        a GPU codec bake-off run.
 struct CodecPoint {
-    std::string codec;
-    double bpw = 0.0;
-    double rel_mse = 0.0;
+    std::string codec;    ///< Codec identifier, e.g. "ae_L64".
+    double bpw = 0.0;     ///< Bits per weight reported by the run.
+    double rel_mse = 0.0; ///< Relative MSE; may be NaN/Inf (see parse_codec_points).
 };
 
-// Parses spike_vqvae --run output lines of the form
-//   [gpu_codec_point] "codec":"ae_L64","bpw":4.117,"rel_mse":7.48e-01,...
-// NaN/Inf rel_mse values are preserved as non-finite doubles (callers check isfinite).
-inline std::vector<CodecPoint> parse_codec_points(const std::string& out) {
-    std::vector<CodecPoint> pts;
-    for (auto it = out.cbegin(); it != out.cend();) {
-        static const std::string tag = "[gpu_codec_point] \"codec\":\"";
-        auto pos = out.find(tag, size_t(it - out.cbegin()));
-        if (pos == std::string::npos) break;
-        auto name_b = pos + tag.size();
-        auto name_e = out.find('"', name_b);
-        if (name_e == std::string::npos) break;
-        CodecPoint p;
-        p.codec = out.substr(name_b, name_e - name_b);
-        auto bpw_k = out.find("\"bpw\":", name_e);
-        auto mse_k = out.find("\"rel_mse\":", name_e);
-        if (bpw_k == std::string::npos || mse_k == std::string::npos) break;
-        p.bpw = std::stod(out.substr(bpw_k + 6));
-        p.rel_mse = std::stod(out.substr(mse_k + 10));
-        pts.push_back(std::move(p));
-        it = out.cbegin() + mse_k + 10;
-    }
-    return pts;
-}
+/// \brief Parses spike_vqvae --run output lines of the form
+///        `[gpu_codec_point] "codec":"ae_L64","bpw":4.117,"rel_mse":7.48e-01,...`
+///
+/// Scans \p out for every occurrence of the `[gpu_codec_point]` tag and pulls
+/// the "codec", "bpw", and "rel_mse" fields via std::stod.
+///
+/// \param out Raw stdout text of a spike run (may contain any other lines).
+/// \return One CodecPoint per matched tag, in order of appearance; empty when
+///         no tag (or a tag missing its required fields) is found. Parsing
+///         stops at the first malformed record.
+///
+/// \note NaN/Inf rel_mse values are preserved as non-finite doubles — callers
+///       should check std::isfinite before using the value.
+std::vector<CodecPoint> parse_codec_points(const std::string& out);
 
 }  // namespace sal

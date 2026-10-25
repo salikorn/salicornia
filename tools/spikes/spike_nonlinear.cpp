@@ -4,6 +4,18 @@
 //   fp16 | int8 RTN | VQ k-means {16,64,256} | linear autoencoder | MLP (GELU) autoencoder
 //   vs the measured global SVD distortion curve (from the fp64 spectrum of the same tensor).
 // Metric: relative MSE on held-out patches vs bits-per-weight. Events -> runs/.
+/// \file
+/// \brief Non-linear-vs-linear codec bake-off on 16x16 patches of a real shard tensor.
+///
+/// Question: does a NON-LINEAR compressor beat LINEAR (SVD) at equal bits-per-weight
+/// on real weights? Candidates: fp16 baseline, per-tensor int8 RTN, VQ k-means with
+/// K in {16,64,256}, and a 256->384->L->384->256 autoencoder in both linear and
+/// MLP(GELU) form for L in {32,64,96} (Adam + cosine LR; latent fp16 round-trip
+/// penalty also reported). The global SVD distortion curve comes from the fp64 Gram
+/// spectrum of the same tensor. Metric: relative MSE on held-out patches vs bpw
+/// (shared decoder bytes amortized over all patches). Results stream as
+/// \c codec_point events (the format tools/autotune-consumers parse via
+/// sal::parse_codec_points).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -25,15 +37,20 @@ namespace la = sal::la;
 using Eigen::MatrixXf;
 using Eigen::VectorXf;
 
+/// \brief Monotonic steady-clock timestamp in seconds (codec timing).
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 static const double kPi = 3.14159265358979323846;
+/// \brief tanh-approximation GELU forward — CPU twin of the GPU kernel formula.
+/// \param x Input. \return Activated value.
 static float gelu(float x) {
     const float k0 = 0.7978845608f;  // sqrt(2/pi)
     return 0.5f * x * (1.0f + std::tanh(k0 * (x + 0.044715f * x * x * x)));
 }
+/// \brief Analytic GELU derivative (tanh form) for backprop.
+/// \param x Pre-activation input. \return d(gelu)/dx at \p x.
 static float dgelu(float x) {
     const float k0 = 0.7978845608f;
     float x3 = x + 0.044715f * x * x * x;
@@ -42,15 +59,23 @@ static float dgelu(float x) {
     return 0.5f * (1 + t) + 0.5f * x * dt;
 }
 
+/// \brief Trainable patch autoencoder: 256 -> 384 -> L -> 384 -> 256 with biases and
+///        Adam (betas 0.9/0.999, eps 1e-8). In linear mode the GELU activations are
+///        skipped (pure linear map stack); in MLP mode they are applied. Weights are
+///        He-initialized (scale sqrt(2/fan_in)) from the caller's seeded RNG.
 struct AE {
-    bool nonlinear;
-    int latent;
-    MatrixXf W1, W2, W3, W4;   // 384x256, Lx384, 384xL, 256x384
+    bool nonlinear;      ///< False = pure linear autoencoder, true = GELU MLP.
+    int latent;          ///< Latent width L (encoder output dim).
+    MatrixXf W1, W2, W3, W4;   ///< 384x256, Lx384, 384xL, 256x384
     VectorXf b1, b2, b3, b4;
-    MatrixXf mW1, mW2, mW3, mW4, vW1, vW2, vW3, vW4;   // Adam moments
+    MatrixXf mW1, mW2, mW3, mW4, vW1, vW2, vW3, vW4;   ///< Adam moments
     VectorXf mb1, mb2, mb3, mb4, vb1, vb2, vb3, vb4;
-    long step = 0;
+    long step = 0;       ///< Adam step counter (bias correction).
 
+    /// \brief Constructs and He-initializes all weights/moments from \p rng.
+    /// \param L   Latent width.
+    /// \param nl  Non-linear (GELU) mode flag.
+    /// \param rng Seeded generator (deterministic run).
     AE(int L, bool nl, std::mt19937& rng) : nonlinear(nl), latent(L) {
         std::normal_distribution<float> g(0, 1);
         auto mk = [&](int rows, int cols, int fanin) {
@@ -73,9 +98,14 @@ struct AE {
     }
 
     // forward batch [B x 256] -> reconstruction, keeping intermediates for backward
+    /// \brief Forward pass keeping intermediates needed by the backward pass.
     struct Fwd {
-        MatrixXf X, H1, Z, H3, Xh;
+        MatrixXf X, H1, Z, H3, Xh;  ///< Input, two hidden activations, bottleneck, reconstruction.
     };
+    /// \brief Forward batch [B x 256] -> reconstruction (X), hidden activations (H1,
+    ///        H3), and bottleneck pre-GELU (Z) for the backward pass.
+    /// \param X Input batch, one 256-dim patch per row.
+    /// \return Fwd with all intermediates.
     Fwd forward(const MatrixXf& X) const {
         Fwd f;
         f.X = X;
@@ -95,8 +125,15 @@ struct AE {
         f.Xh.rowwise() += b4.transpose();
         return f;
     }
+    /// \brief Mean squared reconstruction error of a forward result.
+    /// \param f Forward output. \return squaredNorm(Xh - X) / numel.
     float loss(const Fwd& f) const { return (f.Xh - f.X).squaredNorm() / float(f.X.size()); }
 
+    /// \brief One Adam training step on a batch: forward, backward (recomputing the
+    ///        GELU inputs where needed), gradient of the MSE loss, and a
+    ///        bias-corrected Adam update over all weights and biases.
+    /// \param X  Batch, one 256-dim patch per row.
+    /// \param lr Learning rate (caller schedules cosine decay).
     void train_step(const MatrixXf& X, float lr) {
         Fwd f = forward(X);
         float B = float(X.rows());
@@ -145,10 +182,21 @@ struct AE {
     }
 };
 
+/// \brief Relative MSE between original and reconstruction: ||xh-x||^2 / ||x||^2.
+/// \param x  Original matrix. \param xh Reconstruction.
+/// \return Float ratio (the bake-off's distortion metric).
 static float rel_mse(const MatrixXf& x, const MatrixXf& xh) {
     return float((xh - x).squaredNorm() / x.squaredNorm());
 }
 
+/// \brief Entry point: loads the shard tensor (--shard/--tensor flags), slices it
+///        into 16x16 patches (deterministic shuffled train/validation split,
+///        per-tensor max-abs normalization), then reports codec points: fp16 and
+///        int8 RTN baselines, VQ k-means {16,64,256}, the global SVD curve at ranks
+///        {128,256,512,1024}, and trained linear/MLP autoencoders for L in
+///        {32,64,96} with cosine-decayed Adam (--steps, --batch flags). Each point
+///        is one \c codec_point event; \c svd_done and \c done wrap up.
+/// \return 0 on success, 1 on fatal error.
 int main(int argc, char** argv) {
     std::string shard = "models/GLM-5.3-Flash/model-00062-of-00062.safetensors";
     std::string tensor = "model.language_model.layers.9.self_attn.q_proj.weight";

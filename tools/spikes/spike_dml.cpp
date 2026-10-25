@@ -7,6 +7,27 @@
 // Results go to runs/<ts>-s1s2-dml/events.jsonl (xlab). Run from the repo root.
 // Flags: --warp (force software adapter), --m/--n/--k <int>, --iters <int>, --check <int>.
 
+/// \file
+/// \brief M1 spikes S1+S2: DirectML feasibility probes on this machine's adapter.
+///
+/// S2 answers "what does this driver support?" — adapter identity, DML feature level,
+/// tensor-dtype support, and operator availability via CreateOperator+CompileOperator
+/// (the 1.15.4 header exposes no cheaper query). S1 answers "does it actually run
+/// correctly and fast?" — fp32 identity/softmax sanity ops, then FP16 GEMM correctness
+/// against a CPU reference and timed TFLOP/s at 4096^3.
+///
+/// Findings baked into the design (comments inline): bare CompileOperator dispatches
+/// misbehave on this driver (zeros/hangs), so execution always goes through
+/// compile_single_op_graph(); initializer outputs must bind as a BUFFER_ARRAY; buffer
+/// states are managed with fully explicit transitions — no reliance on implicit
+/// promotion/decay, which old/strict drivers mishandle (Env::transition comment).
+/// Optional diagnostics: SAL_DML_DEBUG enables the D3D12 debug layer, SAL_TRACE prints
+/// per-stage progress, and the info queue is dumped on fatal errors.
+///
+/// Flags: --warp (force software adapter), --compute (compute queue), --skip-gemm,
+/// --notrans (B row-major instead of B^T), --f32check, --single (bare CompileOperator),
+/// --m/--n/--k, --iters, --check.
+
 #define DML_TARGET_VERSION 0x6400
 #include <DirectML.h>
 
@@ -31,6 +52,11 @@
 using Microsoft::WRL::ComPtr;
 
 // ---------------------------------------------------------------- fp16 helpers
+/// \brief Local fp32 -> fp16 converter (round-to-nearest-even), identical to
+///        xlab/fp16.hpp's sal::f32_to_f16 but duplicated here so the spike builds
+///        standalone against raw DML data. See xlab/fp16.hpp for the documented
+///        special cases.
+/// \param f Value to convert. \return 16-bit half pattern.
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -63,6 +89,10 @@ static uint16_t f32_to_f16(float f) {
     return uint16_t(sign | (uint32_t(e) << 10) | kept);
 }
 
+/// \brief Local exact fp16 -> fp32 converter, identical to xlab/fp16.hpp's
+///        sal::f16_to_f32 but duplicated here so the spike builds standalone against
+///        raw DML data. Subnormals are normalized; see that header for semantics.
+/// \param h 16-bit half pattern. \return Exact float value.
 static float f16_to_f32(uint16_t h) {
     uint32_t sign = uint32_t(h >> 15) & 1u;
     uint32_t e = uint32_t(h >> 10) & 0x1Fu;
@@ -91,17 +121,31 @@ static float f16_to_f32(uint16_t h) {
 }
 
 // ---------------------------------------------------------------- helpers
+/// \brief Formats an HRESULT as \c 0x%08X for error messages/events.
 static std::string hr_hex(HRESULT hr) {
     char b[16];
     std::snprintf(b, sizeof b, "0x%08X", (unsigned)hr);
     return b;
 }
+/// \brief Throws std::runtime_error naming \p what and the HRESULT if FAILED(hr).
+/// \param hr   Result to test.
+/// \param what API call name for the error message.
 static void check(HRESULT hr, const char* what) {
     if (FAILED(hr)) throw std::runtime_error(std::string(what) + " failed: " + hr_hex(hr));
 }
+/// \brief Naive wchar -> char narrowing of an adapter description (ASCII names only).
+/// \param w Wide string. \return Narrowed copy.
 static std::string w2s(const std::wstring& w) { return std::string(w.begin(), w.end()); }
 
 // ---------------------------------------------------------------- device env
+/// \brief D3D12 + DirectML environment: adapter selection (hardware, WARP fallback),
+///        device/queue/allocator/list/fence, optional D3D12 debug layer (SAL_DML_DEBUG),
+///        DML device + command recorder, and an optional info queue for diagnostics.
+///
+/// Same resource-state discipline as spike_d3d12.cpp: transition() records explicit
+/// COMMON <-> shader/UAV/COPY barriers because implicit promotion/decay is not relied
+/// on — old/strict drivers mishandle it. submit_and_wait() fences with a 120 s timeout
+/// (hang detector) and then checks GetDeviceRemovedReason.
 struct Env {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> adapter;
@@ -215,6 +259,14 @@ struct Env {
 };
 
 // ---------------------------------------------------------------- buffers
+/// \brief Creates a committed buffer resource, choosing the initial state from the
+///        heap type (UPLOAD -> GENERIC_READ, READBACK -> COPY_DEST, else COMMON).
+///        Same contract as spike_d3d12.cpp's make_buffer.
+/// \param dev       Device to create the resource on.
+/// \param size      Buffer width in bytes.
+/// \param type      Heap type (DEFAULT/UPLOAD/READBACK).
+/// \param allow_uav True to add D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
+/// \return The created resource.
 static ComPtr<ID3D12Resource> make_buffer(ID3D12Device* dev, uint64_t size, D3D12_HEAP_TYPE type,
                                           bool allow_uav) {
     D3D12_HEAP_PROPERTIES props{type};
@@ -238,6 +290,8 @@ static ComPtr<ID3D12Resource> make_buffer(ID3D12Device* dev, uint64_t size, D3D1
     return r;
 }
 
+/// \brief Memcpy-uploads \p size bytes into a mapped UPLOAD-heap buffer.
+/// \param dst  Upload resource. \param data Source bytes. \param size Byte count.
 static void upload_bytes(ID3D12Resource* dst, const void* data, uint64_t size) {
     void* p = nullptr;
     D3D12_RANGE none{0, 0};
@@ -245,6 +299,9 @@ static void upload_bytes(ID3D12Resource* dst, const void* data, uint64_t size) {
     std::memcpy(p, data, size_t(size));
     dst->Unmap(0, nullptr);
 }
+/// \brief Copies \p size bytes out of a READBACK-heap buffer after GPU completion.
+/// \param src  Readback resource. \param size Byte count.
+/// \return Copy of the read region.
 static std::vector<uint8_t> readback_bytes(ID3D12Resource* src, uint64_t size) {
     void* p = nullptr;
     D3D12_RANGE read{0, static_cast<SIZE_T>(size)};
@@ -257,15 +314,21 @@ static std::vector<uint8_t> readback_bytes(ID3D12Resource* src, uint64_t size) {
 }
 
 // ---------------------------------------------------------------- tensor desc
+/// \brief Buffer-tensor description with owning strides/sizes storage (DML's
+///        DML_BUFFER_TENSOR_DESC points into these arrays, so they must outlive it).
 struct TensorInfo {
-    DML_BUFFER_TENSOR_DESC buf{};
-    DML_TENSOR_DESC desc{};
-    UINT sizes[6]{};
-    UINT strides[6]{};
+    DML_BUFFER_TENSOR_DESC buf{};   ///< Buffer tensor descriptor.
+    DML_TENSOR_DESC desc{};         ///< Generic descriptor wrapping \c buf.
+    UINT sizes[6]{};                ///< Dimension sizes backing buf.Sizes.
+    UINT strides[6]{};              ///< Row-major strides backing buf.Strides (optional).
 
+    /// \brief Returns the generic DML_TENSOR_DESC pointer for operator descs.
     const DML_TENSOR_DESC* desc_ptr() const { return &desc; }
 };
 
+/// \brief Bytes per element for the DML tensor data types this spike uses
+///        (2/4/8 for 16/32/64-bit ints and floats, 1 as the fallback).
+/// \param t DML data type. \return Element size in bytes.
 static UINT bytes_per_elem(DML_TENSOR_DATA_TYPE t) {
     switch (t) {
         case DML_TENSOR_DATA_TYPE_FLOAT16:
@@ -281,6 +344,14 @@ static UINT bytes_per_elem(DML_TENSOR_DATA_TYPE t) {
     }
 }
 
+/// \brief Fills a TensorInfo for a contiguous row-major buffer tensor (optionally
+///        computing explicit row-major strides instead of a null Strides pointer).
+/// \param ti               Target to fill.
+/// \param sizes            Dimensions.
+/// \param dt               Data type (fixes TotalTensorSizeInBytes).
+/// \param flags            DML_TENSOR_FLAGS (default none).
+/// \param explicit_strides True to write row-major strides into ti.strides; false for
+///                         a contiguous tensor (Strides = nullptr).
 static void make_tensor(TensorInfo& ti, std::initializer_list<UINT> sizes, DML_TENSOR_DATA_TYPE dt,
                         DML_TENSOR_FLAGS flags = DML_TENSOR_FLAG_NONE, bool explicit_strides = false) {
     ti.buf.DataType = dt;
@@ -312,6 +383,12 @@ static void make_tensor(TensorInfo& ti, std::initializer_list<UINT> sizes, DML_T
 }
 
 // ---------------------------------------------------------------- op probe
+/// \brief S2 operator-availability probe: tries CreateOperator + CompileOperator
+///        (with meta-commands disabled) and reports which stage failed.
+/// \param dml  DML device.
+/// \param od   Operator descriptor to probe.
+/// \param note Receives "CreateOperator <hr>" / "CompileOperator <hr>" on failure.
+/// \return True iff the operator both created and compiled.
 static bool probe_op(IDMLDevice* dml, const DML_OPERATOR_DESC& od, std::string& note) {
     ComPtr<IDMLOperator> op;
     HRESULT hr = dml->CreateOperator(&od, IID_PPV_ARGS(&op));
@@ -328,8 +405,12 @@ static bool probe_op(IDMLDevice* dml, const DML_OPERATOR_DESC& od, std::string& 
     return true;
 }
 
-// Bind an operator initializer's outputs: per DML docs this must be a BUFFER_ARRAY
-// binding (one persistent buffer per compiled operator), never a plain buffer binding.
+/// \brief Binds an operator initializer's outputs. Per DML docs this must be a
+///        BUFFER_ARRAY binding (one persistent buffer per compiled operator), never
+///        a plain buffer binding.
+/// \param table           Binding table targeting the initializer.
+/// \param persistent      Persistent-resource buffer (DEFAULT heap, UAV-capable).
+/// \param persistent_size Exact PersistentResourceSize of the compiled operator.
 static void bind_initializer_outputs(IDMLBindingTable* table, ID3D12Resource* persistent,
                                      uint64_t persistent_size) {
     DML_BUFFER_BINDING pb{persistent, 0, persistent_size};
@@ -338,9 +419,15 @@ static void bind_initializer_outputs(IDMLBindingTable* table, ID3D12Resource* pe
     table->BindOutputs(1, &d);
 }
 
-// Compile a single operator as a one-node DML graph. On this system, bare
-// CompileOperator dispatches are broken (zeros/hangs) while CompileGraph works —
-// the engine always uses this path.
+/// \brief Compiles a single operator as a one-node DML graph. On this system bare
+///        CompileOperator dispatches are broken (zeros/hangs) while CompileGraph
+///        works — the engine always uses this path (--single opts out for A/B runs).
+/// \param env   Environment with an initialized DML device.
+/// \param op    Operator to wrap in the graph node.
+/// \param n_in  Graph input count.
+/// \param n_out Graph output count.
+/// \param flags Execution flags passed to CompileGraph.
+/// \return The compiled graph operator.
 static ComPtr<IDMLCompiledOperator> compile_single_op_graph(Env& env, IDMLOperator* op,
                                                             UINT n_in, UINT n_out,
                                                             DML_EXECUTION_FLAGS flags) {
@@ -374,6 +461,18 @@ static ComPtr<IDMLCompiledOperator> compile_single_op_graph(Env& env, IDMLOperat
 // Executes a 1-in/1-out fp32 op over 4 floats with the full correct DML pattern:
 // staging copies, initializer with BUFFER_ARRAY persistent output, persistent/temp
 // bound at exec, explicit transitions throughout, readback.
+/// \brief Executes a 1-in/1-out fp32 op over 4 floats through the complete correct
+///        DML execution pattern, as an S1 sanity check: staging copy-in, initializer
+///        dispatch (BUFFER_ARRAY persistent output), exec dispatch, readback. Each
+///        submit wraps every resource in explicit transitions per the spike's
+///        resource-state discipline. Logs \c \<name\>_exec with got[]/ok.
+/// \param env     Environment.
+/// \param run     Event sink.
+/// \param name    Op name for the event key and SAL_TRACE lines.
+/// \param od      Operator descriptor.
+/// \param in_data 4 input floats.
+/// \param ref     4 expected output floats.
+/// \param tol     Per-element absolute tolerance for the ok verdict.
 static void run_unary_op(Env& env, xlab::Run& run, const char* name,
                          const DML_OPERATOR_DESC& od, const float in_data[4],
                          const float ref[4], float tol) {
@@ -498,6 +597,8 @@ static void run_unary_op(Env& env, xlab::Run& run, const char* name,
     run.event(std::string(name) + "_exec", buf);
 }
 
+/// \brief S1 sanity op: DML_ELEMENT_WISE_IDENTITY over [1,2,2,1] fp32 (must return
+///        the input bit-for-bit).
 static void run_identity(Env& env, xlab::Run& run) {
     TensorInfo ti, to;
     make_tensor(ti, {1, 2, 2, 1}, DML_TENSOR_DATA_TYPE_FLOAT32);
@@ -509,6 +610,8 @@ static void run_identity(Env& env, xlab::Run& run) {
 }
 
 // Real compute kernel (no metacommand path): softmax1 over [1,2,3,4] -> [0.0321,0.0871,0.2369,0.6439]
+/// \brief S1 sanity op: real compute-kernel softmax1 over [1,2,3,4] -> known
+///        reference (no metacommand path involved).
 static void run_softmax(Env& env, xlab::Run& run) {
     TensorInfo ti, to;
     make_tensor(ti, {1, 1, 1, 4}, DML_TENSOR_DATA_TYPE_FLOAT32);
@@ -523,11 +626,26 @@ static void run_softmax(Env& env, xlab::Run& run) {
 
 // ---------------------------------------------------------------- GEMM
 // Computes C = A * B^T (TransB=TRANSPOSE — the x @ W^T shape every LLM uses).
+/// \brief Aggregated GEMM run statistics for one run_gemm call.
 struct GemmStats {
-    double max_abs_diff = 0.0, mean_abs_diff = 0.0;
-    double ms = 0.0, tflops = 0.0;
+    double max_abs_diff = 0.0, mean_abs_diff = 0.0;  ///< Max / mean |gpu - cpu_ref| element when check_vs_cpu.
+    double ms = 0.0, tflops = 0.0;                   ///< Per-dispatch wall-clock ms and 2*M*N*K throughput (timed batch).
 };
 
+/// \brief Runs one DML GEMM (C = A * B^T by default — the x @ W^T shape every LLM
+///        uses): staging uploads, graph/bare compilation, initializer + exec
+///        dispatches with explicit transitions throughout, warmup + timed batch
+///        (UAV barrier between iterations), optional CPU-reference check from the
+///        same rounded inputs with fp32 accumulation.
+/// \param env          Environment.
+/// \param M,N,K        GEMM dimensions.
+/// \param iters        Timed dispatch count on one command list.
+/// \param check_vs_cpu Read back and compare vs CPU reference (small sizes only).
+/// \param dt           DML_TENSOR_DATA_TYPE_FLOAT16 or _FLOAT32.
+/// \param trans_b      True: B is [N,K] with TransB=TRANSPOSE; false: B is [K,N].
+/// \param use_graph    True: compile via CompileGraph (the working path); false: bare
+///                     CompileOperator (the broken-on-this-driver path, for A/B).
+/// \return GemmStats with correctness and/or timing fields filled.
 static GemmStats run_gemm(Env& env, UINT M, UINT N, UINT K, UINT iters, bool check_vs_cpu,
                           DML_TENSOR_DATA_TYPE dt, bool trans_b = true, bool use_graph = true) {
     GemmStats st;
@@ -788,6 +906,11 @@ static GemmStats run_gemm(Env& env, UINT M, UINT N, UINT K, UINT iters, bool che
 }
 
 // ---------------------------------------------------------------- main
+/// \brief Entry point: parses flags, initializes the environment (optionally WARP /
+///        compute queue), runs the S2 probes (feature level, dtypes, operator
+///        availability), the S1 sanity ops, then fp16/fp32 GEMM correctness and
+///        perf runs per flags. Fatal errors dump the info queue and log \c "fatal".
+/// \return 0 on success, 1 on fatal error.
 int main(int argc, char** argv) {
     bool warp = false, compute = false, skip_gemm = false, notrans = false, f32check = false,
          single = false;

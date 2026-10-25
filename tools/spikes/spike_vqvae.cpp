@@ -4,6 +4,28 @@
 // Models: 256 -> 384(GELU) -> L -> 384(GELU) -> 256, no biases.
 // Storage bits (per weight element): AE/VAE = 16L/256 + shared; VQ-VAE = log2(K)/256 + codebook +
 // shared. All training (forward, backward, Adam) executes as D3D12 compute shaders.
+/// \file
+/// \brief VQ-VAE / VAE / AE codecs trained entirely ON GPU via D3D12 compute shaders
+///        (--run), with a mandatory CPU-vs-GPU one-step parity gate (--gate).
+///
+/// Model: 256 -> 384(GELU) -> L -> 384(GELU) -> 256, no biases. Mode 0 = AE, mode 1 =
+/// VAE (mu/logvar heads, reparameterization, KL beta), mode 2 = VQ-VAE (nearest-code
+/// quantizer, straight-through + commitment loss, EMA codebook update). Weights live
+/// in one packed state buffer [P | M | V] (params, Adam m, Adam v) addressed by tensor
+/// byte offsets through the 8-word constant block; GEMMs, elementwise kernels, Adam,
+/// and the VQ ops all run as kernels from gpu/kernels.hpp — nothing falls back to CPU
+/// during training.
+///
+/// Resource-state discipline: every record_* stage emits explicit
+/// COMMON <-> NON_PIXEL_SHADER_RESOURCE / UNORDERED_ACCESS / COPY_DEST transitions for
+/// exactly the resources it touches (the same contract the production Device wrapper
+/// and tests/test_gpu.cpp document); buffers are created in COMMON. gather_rows feeds
+/// dataset-resident training: the full train matrix stays on GPU (allocated EARLY —
+/// the iGPU driver has shown root-SRV instability with late-allocated large buffers,
+/// see main) and each step gathers one batch by index. --gate must pass (AE 1e-4,
+/// VQ 1e-3 Frobenius-relative — looser because a single fp32 near-tie can flip one
+/// nearest-neighbor index of 512; broken wiring lands at O(1)) before --run is trusted.
+/// TuneParams come from profiles/best.json when present.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -29,24 +51,33 @@ using Microsoft::WRL::ComPtr;
 namespace gpu = sal::gpu;
 using Eigen::MatrixXf;
 
+/// \brief Monotonic steady-clock timestamp in seconds (step/codec timing).
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+/// \brief Bit-casts a float into the 8-word kernel constant block (see test_gpu.cpp).
+/// \param f Value to encode. \return Its uint32 bit pattern.
 static uint32_t f2u(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
     return u;
 }
+/// \brief Inverse of f2u().
+/// \param u uint32 bit pattern. \return Reinterpreted float.
 static float u2f(uint32_t u) {
     float f;
     std::memcpy(&f, &u, 4);
     return f;
 }
+/// \brief tanh-approximation GELU forward — CPU twin of the GPU kernel formula.
+/// \param x Input. \return Activated value.
 static float gelu(float x) {
     const float k0 = 0.7978845608f;
     return 0.5f * x * (1.0f + std::tanh(k0 * (x + 0.044715f * x * x * x)));
 }
+/// \brief Analytic GELU derivative (tanh form) — CPU reference for the gate.
+/// \param x Pre-activation input. \return d(gelu)/dx at \p x.
 static float dgelu(float x) {
     const float k0 = 0.7978845608f;
     float x3 = x + 0.044715f * x * x * x;
@@ -57,15 +88,24 @@ static float dgelu(float x) {
 
 static const int IO = 256, HID = 384;
 
+/// \brief Named-tensor parameter table: keeps each matrix (Eigen, for CPU reference
+///        and init) plus its offset in the packed row-major GPU state buffer
+///        [P | M | V] (offsets into P; M and V repeat the layout at +total, +2*total).
 struct Params {
+    /// \brief One named weight tensor with its state-buffer offset.
     struct T {
-        std::string name;
-        uint32_t rows, cols;
-        uint64_t off;
-        MatrixXf w;
+        std::string name;   ///< Tensor name ("W1", "W2", ...).
+        uint32_t rows, cols;///< Shape.
+        uint64_t off;       ///< Element offset within the P region.
+        MatrixXf w;         ///< Host copy (init + CPU reference).
     };
-    std::vector<T> ts;
-    uint64_t total = 0;
+    std::vector<T> ts;      ///< Tensors in insertion order.
+    uint64_t total = 0;     ///< Total element count (== size of each of P/M/V).
+
+    /// \brief Adds a He-initialized tensor (scale sqrt(2/cols)) at the next offset.
+    /// \param name Tensor name.
+    /// \param rows,cols Shape.
+    /// \param rng Seeded generator.
     void add(const std::string& name, uint32_t rows, uint32_t cols, std::mt19937& rng) {
         T t{name, rows, cols, total, MatrixXf(rows, cols)};
         std::normal_distribution<float> g(0, 1);
@@ -74,11 +114,17 @@ struct Params {
         ts.push_back(std::move(t));
         total += uint64_t(rows) * cols;
     }
+    /// \brief Looks up a tensor by name.
+    /// \param n Tensor name.
+    /// \return Pointer to the entry, or nullptr if absent.
     const T* find(const std::string& n) const {
         for (auto& t : ts)
             if (t.name == n) return &t;
         return nullptr;
     }
+    /// \brief Packs all tensors ROW-MAJOR into one flat vector — the layout the
+    ///        shaders expect (Eigen's own storage is column-major, hence the loop).
+    /// \return Flat [P]-region image of all tensors, in insertion order.
     std::vector<float> flat() const {  // ROW-MAJOR packing (what the shaders expect)
         std::vector<float> v;
         v.reserve(total);
@@ -89,30 +135,51 @@ struct Params {
     }
 };
 
+/// \brief GPU-resident codec trainer: owns all buffers and records one full training
+///        step (batch gather -> forward -> backward -> Adam) into an open command
+///        list as pure kernel dispatches. Modes: 0 = AE, 1 = VAE (mu/logvar heads +
+///        reparameterization, KL weight \p beta), 2 = VQ-VAE (nearest-code
+///        quantizer, commitment loss, EMA codebook).
+///
+/// The ElemGrid contract shows up in the dispatch sizes: elementwise/adam kernels
+/// use tk.p.elem_grid(count) (ceil(count / (G*EPT)) so the shader prelude's EPT runs
+/// cover every element exactly once); vq_nearest is dispatched DIRECTLY with one
+/// group per patch (grid B, matching its numthreads(64) — NOT via elem(), whose
+/// (count+255)/256 grid would cover only a quarter of the batch rows); vq_update
+/// uses tk.p.vqu_grid(K). Adam walks the per-tensor [P|M|V] regions with the
+/// tensor's offset triple in the constant block.
 struct GpuCodec {
-    gpu::Device& dev;
-    gpu::LinAlgKernels& lk;
-    gpu::TrainKernels& tk;
-    int L, mode, K;
-    float beta;
-    uint32_t B;
+    gpu::Device& dev;               ///< Device (owns queue/list/fence).
+    gpu::LinAlgKernels& lk;         ///< GEMM kernels (autotuned geometry).
+    gpu::TrainKernels& tk;          ///< Elementwise/adam/vq kernels.
+    int L, mode, K;                 ///< Latent width, codec mode (0/1/2), VQ codebook size.
+    float beta;                     ///< VAE KL weight (mode 1 only).
+    uint32_t B;                     ///< Batch size (patches per step).
     // VQ-VAE stabilization (standard kit): commitment beta (encoder-side only), codebook
     // EMA gamma (< 1; hard batch-mean replacement oscillates against the moving encoder).
-    float vq_beta = 0.25f;
-    float vq_gamma = 0.25f;
-    Params par;
-    std::unique_ptr<gpu::Buffer> state, gbuf;
-    std::unique_ptr<gpu::Buffer> bX, a1, h1, z, a3, h3, xh, dq, gz, gh3, gh1, gh1b;
-    std::unique_ptr<gpu::Buffer> pack, vgrads, vqout, cb, lossbuf;
+    float vq_beta = 0.25f;          ///< Commitment-loss weight (encoder side, mode 2).
+    float vq_gamma = 0.25f;         ///< Codebook EMA rate (hard batch-mean replacement oscillates against the moving encoder).
+    Params par;                     ///< Parameter table + packed state layout.
+    std::unique_ptr<gpu::Buffer> state, gbuf;     ///< [P|M|V] state and gradient buffers.
+    std::unique_ptr<gpu::Buffer> bX, a1, h1, z, a3, h3, xh, dq, gz, gh3, gh1, gh1b; ///< Activation/gradient scratch (names match the math).
+    std::unique_ptr<gpu::Buffer> pack, vgrads, vqout, cb, lossbuf;  ///< VAE mu/lam/eps pack, VAE grads, VQ quantized+idx, codebook.
     // dataset-resident training: full train matrix on GPU + per-step index gather
-    std::unique_ptr<gpu::Buffer> idxBuf, bxCpu, epsCpu;
-    std::unique_ptr<gpu::Buffer> trainBufOwned;
-    gpu::Buffer* trainBuf = nullptr;  // owned by trainBufOwned, or borrowed (external_train)
-    gpu::Buffer* external_train = nullptr;
-    const float* train_rows = nullptr;   // row-major [ntr, IO], set by bind_dataset
-    uint32_t ntrain = 0;
-    uint64_t BL = 0;
+    std::unique_ptr<gpu::Buffer> idxBuf, bxCpu, epsCpu;  ///< Per-step batch index staging (+ eps staging for VAE).
+    std::unique_ptr<gpu::Buffer> trainBufOwned;          ///< Owned train matrix buffer (when not borrowed).
+    gpu::Buffer* trainBuf = nullptr;  ///< Owned by trainBufOwned, or borrowed (external_train)
+    gpu::Buffer* external_train = nullptr;  ///< Borrowed dataset buffer (set by main; never freed here).
+    const float* train_rows = nullptr;   ///< Row-major [ntr, IO], set by bind_dataset
+    uint32_t ntrain = 0;                 ///< Dataset row count.
+    uint64_t BL = 0;                     ///< B * L, the latent-region length.
 
+    /// \brief Allocates all buffers, He-initializes parameters (seeded deterministically
+    ///        from L/mode/K/beta so --gate CPU and GPU share identical init), uploads
+    ///        [P] and zeroes [M|V]; for mode 2 also seeds the codebook N(0, 0.3)
+    ///        (main later re-seeds it data-aligned for the real runs).
+    /// \param d,l,t Device + kernel sets.
+    /// \param L_,mode_,B_ Latent width, codec mode, batch size.
+    /// \param K_ Codebook size (mode 2 only; 0 otherwise).
+    /// \param beta_ VAE KL weight (mode 1 only).
     GpuCodec(gpu::Device& d, gpu::LinAlgKernels& l, gpu::TrainKernels& t, int L_, int mode_,
              uint32_t B_, int K_ = 0, float beta_ = 0.f)
         : dev(d), lk(l), tk(t), L(L_), mode(mode_), K(K_), beta(beta_), B(B_) {
@@ -167,7 +234,15 @@ struct GpuCodec {
     }
 
     // weights are read from the packed state's P region at tensor offsets
+    /// \brief Byte/element offset of a named tensor inside the packed P region.
+    /// \param n Tensor name. \return Element offset (throws via find()->off if absent).
     uint32_t woff(const char* n) { return uint32_t(par.find(n)->off); }
+    /// \brief Resolves the buffer + shape holding a named tensor (always the packed
+    ///        state buffer; weights are read from its P region at the tensor offset).
+    /// \param[out] buf State buffer.
+    /// \param n Tensor name to resolve.
+    /// \param[out] rows Tensor row count.
+    /// \param[out] cols Tensor column count.
     void welem(gpu::Buffer*& buf, const char* n, uint32_t& rows, uint32_t& cols) {
         auto* t = par.find(n);
         buf = state.get();
@@ -175,6 +250,12 @@ struct GpuCodec {
         cols = t->cols;
     }
 
+    /// \brief Binds the training dataset: borrows an external buffer when
+    ///        \c external_train is set (the shared early-allocated buffer), else
+    ///        uploads \p rows_rowmajor into an owned one; also allocates the per-step
+    ///        index/index-staging buffers and, for mode 1, the eps staging buffer.
+    /// \param rows_rowmajor Row-major [n_rows, IO] normalized patch data.
+    /// \param n_rows Dataset row count.
     void bind_dataset(const float* rows_rowmajor, uint32_t n_rows) {
         train_rows = rows_rowmajor;
         ntrain = n_rows;
@@ -195,6 +276,14 @@ struct GpuCodec {
 
     // Records the batch into the OPEN step list: idx+eps staged via persistent upload
     // buffers, then one gather dispatch. Zero per-step allocations, zero extra submits.
+    /// \brief Records the batch for one step into the OPEN command list: memcpys the
+    ///        host indices (and eps for mode 1) into persistent CpuWrite staging
+    ///        buffers, copies them into GPU-visible buffers under COPY_DEST
+    ///        transitions, then runs one gather_rows dispatch (elem_grid geometry)
+    ///        to materialize batch X. Zero per-step allocations, zero extra submits —
+    ///        the whole step stays one packet.
+    /// \param idx_host Batch of dataset row indices, length B.
+    /// \param eps_host Reparameterization noise [B, L] (mode 1 only; else nullptr).
     void record_batch(const uint32_t* idx_host, const float* eps_host) {
         {
             void* p = nullptr;
@@ -238,6 +327,14 @@ struct GpuCodec {
                        D3D12_RESOURCE_STATE_COMMON);
     }
 
+    /// \brief Records the forward pass into the open list: GEMM/GELU stack to h3/xh;
+    ///        mode 1 adds the mu/logvar heads (packed into `pack`) and the
+    ///        reparameterization z = mu + eps*exp(lam/2) via vae_sample; mode 2
+    ///        quantizes z via vq_nearest dispatched DIRECTLY — grid B, one group per
+    ///        patch, matching that kernel's numthreads(64); elem()'s (count+255)/256
+    ///        grid would cover only a quarter of the batch rows. Every touched buffer
+    ///        gets its explicit transitions here.
+    /// \param with_eps Unused placeholder flag (eps always rides in `pack` at 2*BL).
     void record_forward(bool with_eps) {
         gpu::Buffer* w; uint32_t wr, wc;
         welem(w, "W1", wr, wc);
@@ -285,6 +382,16 @@ struct GpuCodec {
         lk.gemm_nt_rec(dev, *h3, *state, *xh, B, IO, HID, 0, woff("W4"));
     }
 
+    /// \brief Records the backward pass into the open list: MSE gradient
+    ///        (2/(B*IO) scale), decoder backward, GELU backward, encoder backward;
+    ///        mode 2 adds the commitment gradient vq_commit (encoder side only,
+    ///        beta-scaled and matched to the mean-squared recon loss scale 2/(B*IO),
+    ///        decoder/codebook see nothing) and the EMA codebook update vq_update
+    ///        (vqu_grid geometry); mode 1 accumulates mu/lam gradients via vae_grads
+    ///        and sums them elementwise in place. Scratch buffers are reused by
+    ///        liveness (e.g. gh1 doubles as the GELU'd GH3 output). The host batch
+    ///        pointer parameter is intentionally unnamed/unused: X is dataset-resident
+    ///        since record_batch.
     void record_backward(const float* /*host_x*/) {  // host batch no longer needed (resident)
         // D = 2/(B*IO) * (Xh - X)
         uint32_t g[8] = {B * IO, 0, 0, 0, f2u(2.0f / float(B * IO)), 0, 0, 0};
@@ -351,6 +458,12 @@ struct GpuCodec {
         }
     }
 
+    /// \brief Records the Adam step for every tensor into the open list: for each
+    ///        tensor, transitions gbuf/state, dispatches the adam kernel with the
+    ///        tensor's [P|M|V] offset triple, its count, the bias-corrected lr and
+    ///        step, and elem_grid geometry, then transitions back.
+    /// \param lr   Bias-corrected learning rate for this step.
+    /// \param step 1-based step counter (drives Adam bias correction).
     void record_adam(float lr, uint32_t step) {
         for (auto& t : par.ts) {
             dev.transition(gbuf->res(), D3D12_RESOURCE_STATE_COMMON,
@@ -371,14 +484,21 @@ struct GpuCodec {
 };
 
 // ---------------- CPU reference (gate) ----------------
+/// \brief Minimal CPU replica of the AE forward pass used by the parity gate —
+///        copies the four weights from a Params table and forwards with the same
+///        GELU formula, keeping pre-activations for the CPU backward.
 struct CpuRef {
-    MatrixXf W1, W2, W3, W4;
+    MatrixXf W1, W2, W3, W4;  ///< Copied from the GPU codec's init (identical weights).
+    /// \brief Copies the named weights out of \p p.
     explicit CpuRef(const Params& p) {
         W1 = p.find("W1")->w;
         W2 = p.find("W2")->w;
         W3 = p.find("W3")->w;
         W4 = p.find("W4")->w;
     }
+    /// \brief Forward pass; fills pre-activations A1/A3 and activations H1/H3/Z.
+    /// \param X Input batch. \param[out] A1,H1,Z,A3,H3 Intermediates.
+    /// \return Reconstruction.
     MatrixXf fwd(const MatrixXf& X, MatrixXf& A1, MatrixXf& H1, MatrixXf& Z, MatrixXf& A3,
                  MatrixXf& H3) const {
         A1 = X * W1.transpose();          // pre-activation (kept for dgelu in backward)
@@ -392,6 +512,20 @@ struct CpuRef {
     }
 };
 
+/// \brief The --gate parity check: runs one full GPU training step (forward,
+///        backward, Adam) for AE (mode 0) and VQ-VAE (mode 2) on a fixed batch and
+///        compares every intermediate, gradient and post-update parameter against a
+///        CPU reference computed from the same (seeded, identical) init. Includes
+///        mini GEMM self-tests (gemm_nt, gemm_tn), a state-buffer round-trip probe,
+///        an isolated first-GEMM probe, and per-layer/parameter events
+///        (gate_fwd_layer / gate_bwd_layer / gate_param). AE gate: max Frobenius
+///        relative error 1e-4; VQ gate: 1e-3 — looser because a single fp32 near-tie
+///        in nearest-neighbor can flip one index of 512, while broken wiring lands
+///        at O(1) instead of O(1e-4).
+/// \param run Event sink.
+/// \param dev,lk,tk Device + kernel sets (already initialized).
+/// \param Xb Input batch (first `batch` training rows).
+/// \return 0 iff both gates passed, 1 otherwise (a \c fatal event is logged).
 static int run_gate(xlab::Run& run, gpu::Device& dev, gpu::LinAlgKernels& lk, gpu::TrainKernels& tk,
                     const MatrixXf& Xb) {
     const uint32_t B = uint32_t(Xb.rows());
@@ -773,6 +907,14 @@ static int run_gate(xlab::Run& run, gpu::Device& dev, gpu::LinAlgKernels& lk, gp
 }
 
 // ---------------- training loop ----------------
+/// \brief Evaluates a trained codec on \p batches batches of the validation matrix:
+///        uploads each batch, records forward only, and accumulates relative MSE.
+///        For mode 1 (VAE) eps is zeroed so eval is deterministic (z = mu).
+/// \param gc      Trained codec.
+/// \param dev,lk,tk Device + kernel sets.
+/// \param Va      Validation matrix, rows divisible by gc.B.
+/// \param batches Number of batches to evaluate.
+/// \return Relative MSE over the evaluated rows.
 static float eval_rel_mse(GpuCodec& gc, gpu::Device& dev, gpu::LinAlgKernels& lk, gpu::TrainKernels& tk,
                           const MatrixXf& Va, int batches) {
     double err = 0, tot = 0;
@@ -800,6 +942,18 @@ static float eval_rel_mse(GpuCodec& gc, gpu::Device& dev, gpu::LinAlgKernels& lk
     return float(err / tot);
 }
 
+/// \brief Entry point: parses --gate | --run (one is required) plus --steps,
+///        --batch, --shard, --tensor, --bench; optionally enables the D3D12 debug
+///        layer (SAL_DML_DEBUG); loads profiles/best.json when present; builds the
+///        patch dataset (same pipeline as the CPU bake-off in spike_nonlinear.cpp);
+///        --gate runs the parity gate; --run trains each codec config (ae_L64,
+///        vae_L64 at two betas, vqvae K=256/4096) for \p steps with cosine LR and a
+///        100-step VQ warmup ramp, data-aligned codebook init (seeded from real z's
+///        + 0.1*std jitter — random N(0,0.3) codes start far from the z-cloud, which
+///        caused dead codes and a violent first-contact EMA), one packet per step,
+///        then evaluates relative MSE and logs \c gpu_codec_point events
+///        (or \c gpu_bench_point with --bench). Fatal errors dump the info queue.
+/// \return 0 on success, 1 on gate/fatal failure, 2 on usage error.
 int main(int argc, char** argv) {
     std::string shard = "models/GLM-5.3-Flash/model-00062-of-00062.safetensors";
     std::string tensor = "model.language_model.layers.9.self_attn.q_proj.weight";

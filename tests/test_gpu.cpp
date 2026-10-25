@@ -1,4 +1,33 @@
 // gpu (SKIP without a working adapter): kernels + one-step trainer parity vs CPU fp64
+/// \file
+/// \brief GPU kernel and one-step-trainer parity tests (all SKIP without a working
+///        D3D12 adapter — SKIP_IF(!env().ok) in every test).
+///
+/// Methodology: every GPU path is compared against a straight-line CPU reference
+/// computed from the SAME inputs (fixed seeds), asserting max-abs or Frobenius-relative
+/// error far above fp32 noise but far below any wiring bug (1e-4 Frobenius on
+/// gradients, 2e-4 on GEMM elements). One suite-level GpuEnv lazily initializes the
+/// Device once, on first use, so the whole suite degrades to SKIP on adapter-less
+/// machines.
+///
+/// Resource-state discipline (the contract every dispatch here obeys, matching the
+/// production wrappers in kernels.hpp): buffers are created in
+/// D3D12_RESOURCE_STATE_COMMON; before a dispatch each input is transitioned
+/// COMMON -> NON_PIXEL_SHADER_RESOURCE and each output COMMON -> UNORDERED_ACCESS;
+/// after the dispatch the transitions are reversed back to COMMON. Nothing relies on
+/// implicit state promotion/decay — the 2022 Intel iGPU driver under test mishandles
+/// it (the explicit pattern is also what spike_dml.cpp documents). The
+/// "gather_rows production pattern" test additionally exercises the upload path:
+/// a CpuWrite staging buffer copied into place via CopyBufferRegion with
+/// COPY_DEST transitions, then the gather output consumed immediately by a GEMM in
+/// the next packet.
+///
+/// ElemGrid contract: elementwise/adam dispatches size their grid with
+/// TuneParams::elem_grid(count) = ceil(count / (G*EPT)) so the shader prelude's
+/// per-thread EPT run [t*EPT,(t+1)*EPT) covers every element exactly once
+/// (kernels.inl SAL_ELEM_PRELUDE). The Adam tests also show the packed-state layout:
+/// one buffer holds [P | M | V] regions at offsets [0, total), [total, 2*total),
+/// [2*total, 3*total), passed via the 8-word constant block.
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,18 +44,30 @@
 namespace gpu = sal::gpu;
 using Eigen::MatrixXf;
 
+/// \brief Reinterprets a float's bits as uint32 for packing into the 8-word kernel
+///        constant block (floats ride in the same words as integers, e.g. lr/eps).
+/// \param f Value to bit-cast.
+/// \return Bit pattern of \p f.
 static uint32_t f2u(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
     return u;
 }
 
+/// \brief Lazily-initialized shared GPU environment for the whole suite.
+///
+/// On first env() call: Device::init(false) runs FIRST (it must precede the kernel
+/// sets — they compile shaders against the live device), then LinAlgKernels and
+/// TrainKernels are constructed. Any exception marks ok=false; every test then
+/// SKIP_IFs, so a missing/broken adapter is reported, not fatal.
 struct GpuEnv {
-    gpu::Device dev;
-    std::unique_ptr<gpu::LinAlgKernels> lk;
-    std::unique_ptr<gpu::TrainKernels> tk;
-    bool ok = false;
+    gpu::Device dev;                             ///< D3D12 device + queue/list/fence.
+    std::unique_ptr<gpu::LinAlgKernels> lk;      ///< GEMM/syrk kernel set.
+    std::unique_ptr<gpu::TrainKernels> tk;       ///< Elementwise/adam/vq kernel set.
+    bool ok = false;                             ///< True iff init fully succeeded.
 };
+/// \brief Returns the process-wide GpuEnv, initializing it on the first call.
+/// \return Reference to the singleton; check \c .ok before using the device.
 static GpuEnv& env() {
     static GpuEnv* e = []() -> GpuEnv* {
         auto p = new GpuEnv();
@@ -43,10 +84,17 @@ static GpuEnv& env() {
     return *e;
 }
 
+/// \brief tanh-approximation GELU forward, matching the HLSL kernel's formula
+///        (0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))); CPU reference for the elem tests.
+/// \param x Input value.
+/// \return Activated value.
 static float gelu(float x) {
     const float k0 = 0.7978845608f;
     return 0.5f * x * (1.0f + std::tanh(k0 * (x + 0.044715f * x * x * x)));
 }
+/// \brief Analytic GELU derivative (tanh form), CPU reference for gelu_bwd tests.
+/// \param x Input value (pre-activation).
+/// \return d(gelu)/dx at \p x.
 static float dgelu(float x) {
     const float k0 = 0.7978845608f;
     float x3 = x + 0.044715f * x * x * x;
@@ -55,6 +103,12 @@ static float dgelu(float x) {
     return 0.5f * (1 + t) + 0.5f * x * dt;
 }
 
+/// \brief CPU reference for the NT GEMM kernel: C[M,N] = A[M,K] * B[N,K]^T with all
+///        matrices row-major (B stored transposed, as the shader consumes it).
+/// \param a Row-major A, M*K floats.
+/// \param b Row-major B, N*K floats.
+/// \param c Output, resized to M*N.
+/// \param M Rows of A / C. \param N Cols of C / rows of B. \param K Inner dimension.
 static void gemm_nt_ref(const std::vector<float>& a, const std::vector<float>& b,
                         std::vector<float>& c, uint32_t M, uint32_t N, uint32_t K) {
     c.assign(size_t(M) * N, 0.f);
@@ -502,4 +556,7 @@ XLAB_TEST("gather_rows production pattern (40MB, in-list idx copy)") {
     }
 }
 
+/// \brief Entry point: runs the "gpu" suite. Requires a working D3D12 adapter;
+///        every test SKIPs otherwise (suite still exits 0).
+/// \return 0 iff all tests passed or skipped (CTest-compatible).
 int main() { return xlab::test::run_all("gpu"); }

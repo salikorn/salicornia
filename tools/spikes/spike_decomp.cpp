@@ -4,6 +4,17 @@
 //   --st FILE  : real safetensors shard: per-tensor spectrum, energy ranks, L2-lossless ranks,
 //                fp16-quantization comparison, parameter-savings table
 // All events -> runs/<ts>-edecomp/events.jsonl (xlab).
+/// \file
+/// \brief E-DECOMP spike: CPU fp64 experiments establishing what linear decomposition
+///        can do to model weights losslessly, in three modes.
+///
+/// \p --validate runs ground-truth checks on constructed matrices with known spectra
+/// (Jacobi + top-k recovery, the SliceGPT square-Q exact fold, exact-rank truncation).
+/// \p --synth builds rank-300 activations at d=2048 and measures where PCA energy
+/// fractions land and whether the rank cliff is detected. \p --st FILE walks the largest
+/// 2-D float tensors of a real shard: fp64 Gram -> top-k spectrum, tail energy at
+/// {0.5, 0.75, 0.8125} rank fractions, an L2-lossless rank (tail <= fp16 round-trip
+/// error energy), and a parameter-savings table. All results stream as xlab events.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -29,6 +40,8 @@ static double now_s() {
 }
 
 // ---------------------------------------------------------------- helpers
+/// \brief Euclidean (Frobenius) norm of a dense double vector.
+/// \param v Values. \return sqrt(sum of squares).
 static double fro_norm(const std::vector<double>& v) {
     double s = 0;
     for (double x : v) s += x * x;
@@ -36,6 +49,12 @@ static double fro_norm(const std::vector<double>& v) {
 }
 
 // y = W (rmsnorm(x) .* gamma)  — the pre-norm linear block used in the fold test
+/// \brief Computes y = W (rmsnorm(x) .* gamma) — the pre-norm linear block the
+///        square-Q fold theorem is stated on.
+/// \param W     Row-major [m, d] weight matrix.
+/// \param m     Output rows. \param d Input width.
+/// \param x     Input vector, length d. \param gamma Per-channel scale, length d.
+/// \param y     Output vector, resized to m.
 static void norm_linear(const std::vector<double>& W, size_t m, size_t d,
                         const std::vector<double>& x, const std::vector<double>& gamma,
                         std::vector<double>& y) {
@@ -48,6 +67,15 @@ static void norm_linear(const std::vector<double>& W, size_t m, size_t d,
 }
 
 // ---------------------------------------------------------------- --validate
+/// \brief --validate mode: solver ground-truth on constructed matrices with known
+///        spectra. Builds W = U diag(sigma) V^T (216 of 256 singulars non-zero,
+///        geometric decay), then checks (1) Jacobi eigen recovery of W^T W and the
+///        top-k subspace solver against the same ground truth, (2) the SliceGPT
+///        square-Q exact fold (RMS invariance + output equality to 1e-12), and
+///        (3) that truncation to the exact intrinsic rank is lossless, reporting the
+///        parameter saving. Each check logs one \c validate_* event.
+/// \param run Event sink.
+/// \return 0 (throws on solver failure).
 static int mode_validate(xlab::Run& run) {
     std::mt19937_64 rng(99);
     std::normal_distribution<double> gauss(0, 1);
@@ -197,6 +225,13 @@ static int mode_validate(xlab::Run& run) {
 }
 
 // ---------------------------------------------------------------- --synth
+/// \brief --synth mode: generates m=8192 activations of intrinsic rank 300 at d=2048
+///        (plus 1e-3 noise), computes the fp64 Gram, and runs the top-k solver for
+///        k=1843 (0.9*d). Logs the PCA energy captured at the {0.5, 0.75, 0.8125, 0.9}
+///        slice fractions (\c synth_slice_energy) and the detected rank cliff — the
+///        smallest r where lambda_{r+1} < 1e-8 * lambda_1 (\c synth_cliff).
+/// \param run Event sink.
+/// \return 0.
 static int mode_synth(xlab::Run& run) {
     // activations of intrinsic rank 300 (+ small noise), d=2048, m=8192 samples
     const size_t d = 2048, m = 8192, rank = 300;
@@ -254,6 +289,21 @@ static int mode_synth(xlab::Run& run) {
 }
 
 // ---------------------------------------------------------------- --st
+/// \brief --st mode: per-tensor spectrum analysis over a real safetensors shard.
+///
+/// Selects the \p max_tensors largest 2-D BF16/F16/F32 tensors with at least
+/// \p min_elems elements. Per tensor (Gram over the smaller dimension n, transposing
+/// the access when needed): fp64 Gram + fp16 round-trip error energy in one pass,
+/// top-k eigensolver (k = 0.8125n + 32), tail energy relative to the trace at
+/// {0.5, 0.75, 0.8125} fractions, and the L2-lossless rank — the largest slice whose
+/// tail energy still fits under the fp16 quantization error (i.e. low-rank storage
+/// would be no worse than just storing fp16). Logs \c st_tensor_spectrum per tensor
+/// and \c st_tensor_skipped_dtype / \c st_tensor_skipped_impl for exclusions.
+/// \param run         Event sink.
+/// \param path        Shard path.
+/// \param max_tensors Cap on analyzed tensors (default 6).
+/// \param min_elems   Minimum element count to consider (default 1e7).
+/// \return 0 (throws on I/O or solver failure).
 static int mode_st(xlab::Run& run, const std::string& path, size_t max_tensors,
                    uint64_t min_elems) {
     sal::st::SafeTensorsFile f{fs::path(path)};
@@ -357,6 +407,10 @@ static int mode_st(xlab::Run& run, const std::string& path, size_t max_tensors,
 }
 
 // ---------------------------------------------------------------- main
+/// \brief Entry point: parses --validate | --synth | --st FILE plus
+///        --max-tensors N / --min-elems N, opens the xlab run ("edecomp-<mode>"),
+///        dispatches to the mode function. Exit code 2 on usage error, 1 on fatal.
+/// \return Mode's return value, or 2 if no mode was given, or 1 on fatal error.
 int main(int argc, char** argv) {
     std::string mode, st_path;
     size_t max_tensors = 6;

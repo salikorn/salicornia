@@ -1,4 +1,22 @@
 // unit: autotuner logic — candidate enumeration, token substitution, profile round-trip
+/// \file
+/// \brief Unit tests for the autotuner: candidate-space enumeration, HLSL token
+///        substitution, profile round-trip, and the ElemGrid launch-geometry contract.
+///
+/// Runs entirely on the CPU — no GPU device is created, so this suite is the one
+/// autotuner gate that runs in CI-style environments without an adapter. It pins the
+/// contracts the rest of the project relies on:
+///  - candidate spaces: op -> candidate-count map matching autotune.hpp's grids
+///    (tests/test_autotune.cpp:13), unique labels per op, and the 1024-thread
+///    D3D12 group limit constraining every TS candidate (TS x TS <= 1024 => TS <= 32);
+///  - \@TOKEN\@ substitution: complete replacement and rejection of unknown tokens;
+///  - profiles/best.json round-trip incl. the geometry sanity gate (a profile
+///    claiming gemm_ts=1024 is rejected and defaults are kept);
+///  - the ElemGrid contract: elem_threads() = G*EPT and
+///    elem_grid(count) = ceil(count / (G*EPT)), matching the single-pass EPT coverage
+///    of the elementwise shader prelude (kernels.inl SAL_ELEM_PRELUDE: thread t owns
+///    the EPT contiguous elements [t*EPT, (t+1)*EPT), guarded by \c i < BOUND, so
+///    grid = elem_grid(count) covers every index exactly once for any count).
 #include <filesystem>
 #include <set>
 
@@ -107,4 +125,7 @@ XLAB_TEST("elem geometry helpers agree with token values") {
     CHECK(d.at("EPT") == "4");
 }
 
+/// \brief Entry point: runs the "autotune" suite, writing JSONL events to
+///        runs/\<ts\>-test-autotune/events.jsonl.
+/// \return 0 iff all tests passed (CTest-compatible).
 int main() { return xlab::test::run_all("autotune"); }

@@ -13,6 +13,23 @@ endif()
 set(SAL_DML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/directml")
 
 # ---------------------------------------------------------------------------
+# sal_core — implementations split out of the src/ headers (hpp declares, cpp
+# defines). Static lib; each target pulls only the objects whose symbols it uses.
+# ---------------------------------------------------------------------------
+add_library(sal_core STATIC
+  src/gpu/cs.cpp
+  src/gpu/autotune.cpp
+  src/compress/linalg.cpp
+  src/compress/codec_points.cpp
+  src/st/safetensors.cpp)
+target_include_directories(sal_core PRIVATE src extern extern/eigen)
+if(MSVC)
+  # /openmp: linalg.cpp's Eigen products were previously inlined into /openmp
+  # consumers; keep Eigen's OpenMP path active for identical behavior.
+  target_compile_options(sal_core PRIVATE /openmp)
+endif()
+
+# ---------------------------------------------------------------------------
 # spike_dml — M1/S1+S2: DirectML device probes + FP16 GEMM correctness/perf
 # ---------------------------------------------------------------------------
 add_executable(spike_dml tools/spikes/spike_dml.cpp)
@@ -29,6 +46,7 @@ add_custom_command(TARGET spike_dml POST_BUILD
 # ---------------------------------------------------------------------------
 add_executable(spike_decomp tools/spikes/spike_decomp.cpp)
 target_include_directories(spike_decomp PRIVATE src extern extern/eigen)
+target_link_libraries(spike_decomp PRIVATE sal_core)
 if(MSVC)
   target_compile_options(spike_decomp PRIVATE /openmp)
 endif()
@@ -45,7 +63,7 @@ target_link_libraries(spike_d3d12 PRIVATE d3d12 dxgi)
 # ---------------------------------------------------------------------------
 add_executable(spike_gpu_linalg tools/spikes/spike_gpu_linalg.cpp)
 target_include_directories(spike_gpu_linalg PRIVATE src extern extern/eigen)
-target_link_libraries(spike_gpu_linalg PRIVATE d3d12 dxgi)
+target_link_libraries(spike_gpu_linalg PRIVATE sal_core d3d12 dxgi)
 if(MSVC)
   target_compile_options(spike_gpu_linalg PRIVATE /openmp)
 endif()
@@ -55,6 +73,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(spike_nonlinear tools/spikes/spike_nonlinear.cpp)
 target_include_directories(spike_nonlinear PRIVATE src extern extern/eigen)
+target_link_libraries(spike_nonlinear PRIVATE sal_core)
 if(MSVC)
   target_compile_options(spike_nonlinear PRIVATE /openmp)
 endif()
@@ -64,7 +83,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(spike_vqvae tools/spikes/spike_vqvae.cpp)
 target_include_directories(spike_vqvae PRIVATE src extern extern/eigen)
-target_link_libraries(spike_vqvae PRIVATE d3d12 dxgi)
+target_link_libraries(spike_vqvae PRIVATE sal_core d3d12 dxgi)
 
 # ---------------------------------------------------------------------------
 # test suite (ctest -L unit | -L gpu | -L perf)
@@ -74,6 +93,7 @@ enable_testing()
 function(sal_test name labels)
   add_executable(${name} tests/${name}.cpp)
   target_include_directories(${name} PRIVATE src extern)
+  target_link_libraries(${name} PRIVATE sal_core)
   if(MSVC)
     target_compile_options(${name} PRIVATE /openmp)
   endif()
@@ -87,6 +107,7 @@ sal_test(test_codecs "unit")
 
 add_executable(test_linalg tests/test_linalg.cpp)
 target_include_directories(test_linalg PRIVATE src extern extern/eigen)
+target_link_libraries(test_linalg PRIVATE sal_core)
 if(MSVC)
   target_compile_options(test_linalg PRIVATE /openmp)
 endif()
@@ -95,7 +116,7 @@ set_tests_properties(test_linalg PROPERTIES LABELS "unit")
 
 add_executable(test_gpu tests/test_gpu.cpp)
 target_include_directories(test_gpu PRIVATE src extern extern/eigen)
-target_link_libraries(test_gpu PRIVATE d3d12 dxgi)
+target_link_libraries(test_gpu PRIVATE sal_core d3d12 dxgi)
 if(MSVC)
   target_compile_options(test_gpu PRIVATE /openmp)
 endif()
@@ -104,9 +125,12 @@ set_tests_properties(test_gpu PROPERTIES LABELS "gpu")
 
 add_executable(autotune tools/autotune.cpp)
 target_include_directories(autotune PRIVATE src extern extern/eigen)
-target_link_libraries(autotune PRIVATE d3d12 dxgi)
+target_link_libraries(autotune PRIVATE sal_core d3d12 dxgi)
 
 add_executable(test_autotune tests/test_autotune.cpp)
 target_include_directories(test_autotune PRIVATE src extern)
+# substitute_tokens/tmpl live in cs.cpp.obj, whose other symbols need the D3D
+# import libs; the test itself never touches the GPU at runtime.
+target_link_libraries(test_autotune PRIVATE sal_core d3d12 dxgi)
 add_test(NAME test_autotune COMMAND test_autotune)
 set_tests_properties(test_autotune PROPERTIES LABELS "unit")

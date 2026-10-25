@@ -1,4 +1,14 @@
 // unit: fp64 decomposition kit (eigen recovery, exact fold, exact-rank lossless, orthonormalize)
+/// \file
+/// \brief Tests for the fp64 decomposition kit in compress/linalg.hpp.
+///
+/// Each test builds a matrix with a KNOWN spectrum from random orthogonal factors and
+/// a chosen singular-value vector, so the pass/fail bounds are absolute-precision
+/// claims, not cross-implementation comparisons: Jacobi eigen recovery to 1e-9 relative,
+/// the square-Q SliceGPT fold to 1e-12, exact-rank truncation to 1e-12, and
+/// orthonormality to 1e-10. The top-k subspace solver is only bounded loosely (3e-2)
+/// because clustered spectra converge slowly — the exact-solver test carries the
+/// precision claim (comment at tests/test_linalg.cpp:46).
 #include <cmath>
 #include <random>
 #include <vector>
@@ -122,4 +132,6 @@ XLAB_TEST("orthonormalize produces Q^T Q = I") {
     CHECK((V2 - V).norm() < 1e-8);
 }
 
+/// \brief Entry point: runs the "linalg" suite (JSONL events under runs/).
+/// \return 0 iff all tests passed (CTest-compatible).
 int main() { return xlab::test::run_all("linalg"); }

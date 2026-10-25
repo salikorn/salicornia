@@ -2,63 +2,81 @@ python 3.14.3, 12 logical CPUs
 
 [a] sequential large-read throughput on C:\Users\salistellix\Desktop\salikorn\models\GLM-5.3-Flash\model-00062-of-00062.safetensors
     file size: 1,261,584,968 bytes (1.262 GB decimal)
-  seq cold-ish 8MB: 1,261,584,968 bytes in    0.552s ->   2287.5 MB/s (  2181.6 MiB/s)
-  seq cold-ish 64MB: 1,261,584,968 bytes in    0.520s ->   2424.6 MB/s (  2312.3 MiB/s)
-  seq  warm 8MB: 1,261,584,968 bytes in    0.482s ->   2616.2 MB/s (  2495.0 MiB/s)
-  seq warm 32MB: 1,261,584,968 bytes in    0.555s ->   2275.1 MB/s (  2169.7 MiB/s)
-  seq warm 64MB: 1,261,584,968 bytes in    0.528s ->   2388.2 MB/s (  2277.6 MiB/s)
+  seq cold-ish 8MB: 1,261,584,968 bytes in    0.532s ->   2370.6 MB/s (  2260.8 MiB/s)
+  seq cold-ish 64MB: 1,261,584,968 bytes in    0.494s ->   2553.5 MB/s (  2435.2 MiB/s)
+  seq  warm 8MB: 1,261,584,968 bytes in    0.489s ->   2580.2 MB/s (  2460.7 MiB/s)
+  seq warm 32MB: 1,261,584,968 bytes in    0.516s ->   2445.5 MB/s (  2332.3 MiB/s)
+  seq warm 64MB: 1,261,584,968 bytes in    0.532s ->   2372.5 MB/s (  2262.6 MiB/s)
 
 [b] 4KB random-read throughput over a 1 GB window
-    20,000 x 4KB reads, 81,920,000 bytes in 0.527s -> 155.30 MB/s (37,915 IOPS)
+    20,000 x 4KB reads, 81,920,000 bytes in 0.500s -> 163.82 MB/s (39,996 IOPS)
+
+[a-direct] TRUE cold: sequential direct I/O (FILE_FLAG_NO_BUFFERING), 8 MB chunks
+  direct cold 8MB: 1,261,584,968 bytes in 0.428s ->   2948.9 MB/s (  2812.3 MiB/s)
+[b-direct] TRUE cold: 4KB random direct I/O over 1 GB window
+    5,000 x 4KB direct reads, 20,480,000 bytes in 0.561s -> 36.47 MB/s (8,905 IOPS)
 
 [pass estimate] one full 328 GB model pass at measured seq rates
-   cold-ish 8MB:   2287.5 MB/s ->     2.4 min
-  cold-ish 64MB:   2424.6 MB/s ->     2.3 min
-       warm 8MB:   2616.2 MB/s ->     2.1 min
-      warm 32MB:   2275.1 MB/s ->     2.4 min
-      warm 64MB:   2388.2 MB/s ->     2.3 min
+   cold-ish 8MB:   2370.6 MB/s ->     2.3 min
+  cold-ish 64MB:   2553.5 MB/s ->     2.1 min
+       warm 8MB:   2580.2 MB/s ->     2.1 min
+      warm 32MB:   2445.5 MB/s ->     2.2 min
+      warm 64MB:   2372.5 MB/s ->     2.3 min
+  true-cold direct:   2948.9 MB/s ->     1.9 min
 
 JSON:
 {
   "seq": {
     "cold-ish 8MB": {
-      "dt": 0.551506399999198,
+      "dt": 0.5321853999994346,
       "bytes": 1261584968,
-      "MBps": 2287.52552645234
+      "MBps": 2370.5741796023344
     },
     "cold-ish 64MB": {
-      "dt": 0.5203242000061437,
+      "dt": 0.4940654000020004,
       "bytes": 1261584968,
-      "MBps": 2424.6132853038625
+      "MBps": 2553.4776731883917
     },
     "warm 8MB": {
-      "dt": 0.4822268999996595,
+      "dt": 0.488940499999444,
       "bytes": 1261584968,
-      "MBps": 2616.164647805609
+      "MBps": 2580.242315785734
     },
     "warm 32MB": {
-      "dt": 0.5545233000011649,
+      "dt": 0.5158700999963912,
       "bytes": 1261584968,
-      "MBps": 2275.0801778705236
+      "MBps": 2445.54776097476
     },
     "warm 64MB": {
-      "dt": 0.528250700001081,
+      "dt": 0.5317503999976907,
       "bytes": 1261584968,
-      "MBps": 2388.2315120404355
+      "MBps": 2372.5134348850115
     }
   },
   "random4k": {
-    "MBps": 155.2989609260075,
-    "iops": 37914.78538232605,
-    "dt": 0.5274987000011606,
+    "MBps": 163.8238797314522,
+    "iops": 39996.06438756157,
+    "dt": 0.5000491999962833,
     "bytes": 81920000,
     "n_reads": 20000
   },
+  "seq_direct": {
+    "MBps": 2948.8920439246886,
+    "dt": 0.42781660000036936,
+    "bytes": 1261584968
+  },
+  "random4k_direct": {
+    "MBps": 36.474211770211895,
+    "iops": 8904.83685796189,
+    "dt": 0.5614926000052947,
+    "bytes": 20480000
+  },
   "pass328GB_min": {
-    "cold-ish 8MB": 2.3897729679741624,
-    "cold-ish 64MB": 2.254655082441966,
-    "warm 8MB": 2.089572868149566,
-    "warm 32MB": 2.402845719390633,
-    "warm 64MB": 2.2890019828923984
+    "cold-ish 8MB": 2.306051721015414,
+    "cold-ish 64MB": 2.1408711437217036,
+    "warm 8MB": 2.118664062371972,
+    "warm 32MB": 2.2353546939061752,
+    "warm 64MB": 2.3041667904955907,
+    "true-cold direct 8MB": 1.8538035930915482
   }
 }

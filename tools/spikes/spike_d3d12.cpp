@@ -3,6 +3,24 @@
 // pipeline is game-tested. This spike runs a hand-written tiled fp32 GEMM (C = A * B^T)
 // via a runtime-compiled SM5.1 compute shader (d3dcompiler_47, loaded dynamically).
 // Events -> runs/<ts>-s8-d3d12/events.jsonl. Flags: --warp, --check N, --sizes a,b,c.
+/// \file
+/// \brief S8 spike: hand-written D3D12 compute-shader fp32 GEMM (C = A * B^T) on the
+///        iGPU, bypassing DirectML entirely.
+///
+/// Rationale: the 2022 Intel driver hangs every DirectML dispatch (see spike_dml.cpp),
+/// while its plain compute pipeline is game-tested. The spike compiles a 16x16-tiled
+/// SM5.1 shader at runtime via dynamically-loaded d3dcompiler_47, stages inputs through
+/// UPLOAD-heap copies into DEFAULT-heap buffers, and checks correctness against a
+/// double-precision CPU reference on one small size before timing larger ones.
+///
+/// Resource-state discipline (same contract as the production Device wrapper):
+/// buffers are created in D3D12_RESOURCE_STATE_COMMON and every dispatch is wrapped in
+/// explicit COMMON -> NON_PIXEL_SHADER_RESOURCE / UNORDERED_ACCESS transitions and back;
+/// repeated writes to buf_c inside one list get a UAV barrier between iterations
+/// (spike_d3d12.cpp:340). Nothing relies on implicit promotion/decay. Each packet ends
+/// with a fence wait whose timeout doubles as a hang detector, followed by a
+/// GetDeviceRemovedReason check so a TDR is reported instead of silently producing
+/// garbage. Events go to runs/\<ts\>-s8-d3d12[-warp]/events.jsonl.
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
@@ -53,15 +71,27 @@ void cs_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
+/// \brief Formats an HRESULT as \c 0x%08X for error messages/events.
 static std::string hr_hex(HRESULT hr) {
     char b[16];
     std::snprintf(b, sizeof b, "0x%08X", (unsigned)hr);
     return b;
 }
+/// \brief Throws std::runtime_error naming \p what and the HRESULT if FAILED(hr).
+/// \param hr   Result to test.
+/// \param what API call name for the error message.
 static void check(HRESULT hr, const char* what) {
     if (FAILED(hr)) throw std::runtime_error(std::string(what) + " failed: " + hr_hex(hr));
 }
 
+/// \brief Minimal D3D12 compute environment: adapter selection (hardware, falling back
+///        to WARP), device, compute queue, one allocator/list, fence + event.
+///
+/// begin() resets allocator+list for a new packet; submit_and_wait() closes the list,
+/// executes, signals the fence and waits up to 120 s (a timeout throws — the spike's
+/// hang detector), then checks GetDeviceRemovedReason so a TDR surfaces as an error.
+/// transition()/uav_barrier() record the explicit resource barriers the spike's
+/// resource-state discipline requires (no implicit promotion/decay).
 struct Env {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> adapter;
@@ -143,6 +173,13 @@ struct Env {
     }
 };
 
+/// \brief Creates a committed buffer resource, choosing the initial state from the
+///        heap type (UPLOAD -> GENERIC_READ, READBACK -> COPY_DEST, else COMMON).
+/// \param dev      Device to create the resource on.
+/// \param size     Buffer width in bytes.
+/// \param type     Heap type (DEFAULT/UPLOAD/READBACK).
+/// \param uav_flag True to add D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
+/// \return The created resource.
 static ComPtr<ID3D12Resource> make_buffer(ID3D12Device* dev, uint64_t size, D3D12_HEAP_TYPE type,
                                           bool uav_flag) {
     D3D12_HEAP_PROPERTIES props{type};
@@ -164,6 +201,8 @@ static ComPtr<ID3D12Resource> make_buffer(ID3D12Device* dev, uint64_t size, D3D1
           "CreateCommittedResource");
     return r;
 }
+/// \brief Memcpy-uploads \p size bytes into a mapped UPLOAD-heap buffer.
+/// \param dst  Upload resource. \param data Source bytes. \param size Byte count.
 static void upload_bytes(ID3D12Resource* dst, const void* data, uint64_t size) {
     void* p = nullptr;
     D3D12_RANGE none{0, 0};
@@ -172,12 +211,19 @@ static void upload_bytes(ID3D12Resource* dst, const void* data, uint64_t size) {
     dst->Unmap(0, nullptr);
 }
 
+/// \brief Compiled GEMM pipeline artifacts (rootsig + PSO), stored globally because
+///        run_gemm_cs records dispatches across multiple packets.
 struct ShaderKit {
-    ComPtr<ID3D12RootSignature> rootsig;
-    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12RootSignature> rootsig;  ///< [0]=SRV t0 (A), [1]=SRV t1 (B), [2]=UAV u0 (C), [3]=32-bit constants b0.
+    ComPtr<ID3D12PipelineState> pso;      ///< cs_5_1 compute pipeline.
 };
 static ShaderKit kit;
 
+/// \brief Compiles the embedded GEMM HLSL at runtime (d3dcompiler_47 loaded
+///        dynamically — no import lib in the Windows SDK), serializes the root
+///        signature, and creates the compute PSO. Logs an \c hlsl_compiled event.
+/// \exception std::runtime_error On any load/compile/serialize/Create* failure, with
+///            the compiler's diagnostic blob when compilation fails.
 static void build_shader(Env& env, xlab::Run& run) {
     // runtime compile via d3dcompiler_47 (dynamic load — no import lib in the Windows SDK)
     HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -235,6 +281,16 @@ static void build_shader(Env& env, xlab::Run& run) {
           "CreateComputePipelineState");
 }
 
+/// \brief Runs the GEMM spike once for one (M,N,K): allocates buffers, uploads A/B via
+///        staging copies, dispatches a warmup packet, optionally verifies against a
+///        double-precision CPU reference (logs \c cs_gemm_correct), then times
+///        \p iters back-to-back dispatches on one command list (UAV barrier between
+///        writes) and logs \c cs_gemm_perf with ms and TFLOP/s.
+/// \param env         Initialized environment.
+/// \param run         Event sink.
+/// \param M,N,K       GEMM dimensions (C = A * B^T).
+/// \param iters       Dispatch count for the timed batch.
+/// \param correctness True to run the CPU-reference verification pass (small sizes).
 static void run_gemm_cs(Env& env, xlab::Run& run, UINT M, UINT N, UINT K, UINT iters,
                         bool correctness) {
     const UINT64 asz = uint64_t(M) * K * 4, bsz = uint64_t(N) * K * 4, osz = uint64_t(M) * N * 4;
@@ -363,6 +419,12 @@ static void run_gemm_cs(Env& env, xlab::Run& run, UINT M, UINT N, UINT K, UINT i
     run.event("cs_gemm_perf", b);
 }
 
+/// \brief Entry point: parses --warp, --check N (correctness size), --iters N,
+///        --sizes a,b,c (timed sizes; default 512/1024/2048), initializes the
+///        environment (forced WARP with --warp or when no hardware adapter exists),
+///        compiles the shader, runs the correctness pass, then times every size.
+///        Fatal errors are logged as a \c "fatal" event with exit code 1.
+/// \return 0 on success, 1 on fatal error.
 int main(int argc, char** argv) {
     bool warp = false;
     UINT check = 256;

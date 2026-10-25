@@ -1,8 +1,15 @@
-// salikorn / gpu / autotune — tuning-parameter space, candidate enumeration, and
-// profiles/best.json I/O shared by tools/autotune.cpp and production kernel sets.
+/** \file
+ *  \brief Tuning-parameter space, candidate enumeration, and profiles/best.json
+ *         I/O shared by tools/autotune.cpp and production kernel sets.
+ *
+ * Candidate grids/spaces stay inline here; the profile I/O implementations live in
+ * autotune.cpp. <nlohmann/json.hpp> remains because save_profile's signature
+ * exposes nlohmann::json.
+ */
 #pragma once
 
-#include <fstream>
+#include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -12,15 +19,18 @@
 
 namespace sal::gpu::autotune {
 
-// One launch-geometry configuration for one op.
+/// \brief One launch-geometry configuration for one op: the compile-time
+///        defines to substitute into the shader template plus the dispatch-level
+///        parameters the tuner varies alongside them.
 struct Cand {
-    std::map<std::string, std::string> defines;  // HLSL @TOKEN@ substitutions
-    std::string label;                           // e.g. "TS=32"
-    // dispatch-level params (not compile-time):
-    int syrk_chunk = 2048;
-    int ept = 1;  // elements per thread for the elem family (also in defines as @EPT@)
+    std::map<std::string, std::string> defines;  ///< HLSL &#64;TOKEN&#64; substitutions
+    std::string label;                           ///< human-readable id, e.g. "TS=32"
+    int syrk_chunk = 2048; ///< dispatch-level params (not compile-time): syrk output-column chunk
+    int ept = 1;  ///< elements per thread for the elem family (also in defines as &#64;EPT&#64;)
 };
 
+/// \brief The candidate list for one op, keyed by the op name used in profiles
+///        and in spaces()' `only` filter.
 struct OpSpace {
     const char* op;
     std::vector<Cand> cands;
@@ -28,17 +38,34 @@ struct OpSpace {
 
 // Candidate grids. Full = exhaustive over the declared space; quick = pruned to the
 // historically competitive half. Keep grids in one place — test_autotune checks counts.
+
+/// \brief GEMM/syrk tile-edge candidates: {8,16,32} full, {16,32} quick.
 inline std::vector<int> ts_grid(bool quick) { return quick ? std::vector<int>{16, 32}
                                                             : std::vector<int>{8, 16, 32}; }
+/// \brief Elementwise group-size candidates: {64,128,256} full, {128,256} quick.
 inline std::vector<int> g_grid(bool quick) { return quick ? std::vector<int>{128, 256}
                                                            : std::vector<int>{64, 128, 256}; }
+/// \brief Elements-per-thread candidates: {1,2,4} full, {1,2} quick.
 inline std::vector<int> ept_grid(bool quick) { return quick ? std::vector<int>{1, 2}
                                                              : std::vector<int>{1, 2, 4}; }
+/// \brief vq_nearest threads-per-group candidates: {32,64,128} full, {64,128} quick.
 inline std::vector<int> tp_grid(bool quick) { return quick ? std::vector<int>{64, 128}
                                                             : std::vector<int>{32, 64, 128}; }
+/// \brief syrk dispatch-chunk candidates: {1024,2048} full, {2048} quick.
 inline std::vector<int> chunk_grid(bool quick) { return quick ? std::vector<int>{2048}
                                                                : std::vector<int>{1024, 2048}; }
 
+/** \brief Enumerate the tuning space as one OpSpace per requested op.
+ *
+ * Candidate-gating protocol, producer side: each op gets only the candidate
+ * family its shader templates accept (gemm_nt/nn/tn share the TS grid; syrk
+ * pairs TS with a dispatch-level chunk; elem/adam sweep the G x EPT cross
+ * product; vq_nearest sweeps TP; vq_update sweeps G). `quick` prunes each grid
+ * to the historically competitive half so a sweep fits in interactive time.
+ *
+ * \param quick  prune to the reduced grids.
+ * \param only   op names to include; empty means all ops.
+ */
 inline std::vector<OpSpace> spaces(bool quick, const std::vector<std::string>& only) {
     auto wanted = [&](const char* op) {
         if (only.empty()) return true;
@@ -87,53 +114,34 @@ inline std::vector<OpSpace> spaces(bool quick, const std::vector<std::string>& o
     return out;
 }
 
-// Apply one candidate to a TuneParams (dispatch-level fields only; defines are per-kernel).
+/// \brief Apply one candidate's dispatch-level fields to a TuneParams (syrk_chunk,
+///        elem_ept). The compile-time defines are NOT applied here — they are
+///        per-kernel and already baked into the compiled Kernel objects the
+///        caller rebuilds per candidate.
 inline void apply_dispatch(TuneParams& tp, const Cand& c) {
     tp.syrk_chunk = c.syrk_chunk;
     tp.elem_ept = c.ept;
 }
 
-// Serialize. winners: op -> {param key -> value, "ms": best median, "label": ...}.
-inline void save_profile(const std::string& path, const TuneParams& tp,
-                         const std::map<std::string, nlohmann::json>& winners,
-                         const std::string& adapter) {
-    nlohmann::json j;
-    j["version"] = 1;
-    j["adapter"] = adapter;
-    j["tunables"] = {{"gemm_ts", tp.gemm_ts},
-                     {"elem_g", tp.elem_g},
-                     {"elem_ept", tp.elem_ept},
-                     {"vqn_tp", tp.vqn_tp},
-                     {"vqu_g", tp.vqu_g},
-                     {"syrk_chunk", tp.syrk_chunk}};
-    j["winners"] = winners;
-    std::ofstream out(path);
-    out << j.dump(2) << "\n";
-}
+/// \brief Write a tuning profile as JSON: schema version (1), the adapter name,
+///        the full TuneParams snapshot under "tunables", and the per-op winners
+///        map. Caller's job to pick a writable `path` (convention: profiles/best.json).
+void save_profile(const std::string& path, const TuneParams& tp,
+                  const std::map<std::string, nlohmann::json>& winners,
+                  const std::string& adapter);
 
-// Returns false when the file is missing or unparsable (caller keeps defaults).
-inline bool load_profile(const std::string& path, TuneParams& tp) {
-    if (!std::filesystem::exists(path)) return false;
-    try {
-        nlohmann::json j = nlohmann::json::parse(std::ifstream(path));
-        auto t = j.at("tunables");
-        TuneParams cand;  // parse into a temporary; commit only when fully valid
-        cand.gemm_ts = t.value("gemm_ts", tp.gemm_ts);
-        cand.elem_g = t.value("elem_g", tp.elem_g);
-        cand.elem_ept = t.value("elem_ept", tp.elem_ept);
-        cand.vqn_tp = t.value("vqn_tp", tp.vqn_tp);
-        cand.vqu_g = t.value("vqu_g", tp.vqu_g);
-        cand.syrk_chunk = t.value("syrk_chunk", tp.syrk_chunk);
-        if (cand.gemm_ts < 4 || cand.gemm_ts > 32 || cand.elem_g < 32 || cand.elem_g > 1024 ||
-            cand.elem_ept < 1 || cand.elem_ept > 8 || cand.vqn_tp < 8 || cand.vqn_tp > 256 ||
-            cand.vqu_g < 8 || cand.vqu_g > 1024 || cand.syrk_chunk < 64 ||
-            cand.syrk_chunk > 65536)
-            return false;
-        tp = cand;
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
-}
+/** \brief Read a tuning profile into `tp` — the consumer side of the
+ *         candidate-gating protocol.
+ *
+ * Gate: the "tunables" block is parsed into a temporary TuneParams and committed
+ * to `tp` only when every field is inside the hard validity ranges
+ * (gemm_ts 4..32 — the 1024-thread group limit makes 32 the ceiling for the
+ * TS x TS group; elem_g 32..1024; elem_ept 1..8; vqn_tp 8..256; vqu_g 8..1024;
+ * syrk_chunk 64..65536). Missing keys fall back to `tp`'s current values.
+ *
+ * \return True on a fully valid parse; false when the file is missing,
+ *         unparsable, or any value is out of range (caller keeps defaults).
+ */
+bool load_profile(const std::string& path, TuneParams& tp);
 
 }  // namespace sal::gpu::autotune

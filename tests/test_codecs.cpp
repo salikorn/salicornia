@@ -1,4 +1,12 @@
 // unit: codec result parsing + int8 RTN + bpw arithmetic
+/// \file
+/// \brief Unit tests for codec bookkeeping: GPU-codec output-line parsing, int8
+///        round-to-nearest quantization math, and bits-per-weight arithmetic.
+///
+/// All CPU-only. The bpw test re-derives the measured benchmark numbers (AE fp16
+/// latents ~4.117 bpw, VQ-VAE K=256 ~0.156 bpw) from first principles — shared
+/// decoder bytes amortized over all patches — so a future change in the bpw
+/// convention breaks a test instead of silently shifting the bake-off tables.
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -59,4 +67,6 @@ XLAB_TEST("bpw arithmetic") {
     CHECK(bpw_K256 > 0.1 && bpw_K256 < 0.2);  // matches the measured 0.156
 }
 
+/// \brief Entry point: runs the "codecs" suite (JSONL events under runs/).
+/// \return 0 iff all tests passed (CTest-compatible).
 int main() { return xlab::test::run_all("codecs"); }

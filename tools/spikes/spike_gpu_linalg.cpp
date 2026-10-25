@@ -4,6 +4,19 @@
 //                real shard tensor; gates on trace/lambda/tail-energy deviations.
 //   --bench    : wall-clock CPU-only vs hybrid pipeline.
 // Hybrid = GPU does G*V multiplies (chunked <2s dispatches); CPU does Rayleigh+Cholesky QR.
+/// \file
+/// \brief GPU-linalg spike: fp32 Gram + hybrid subspace eigensolver on the iGPU, with
+///        an explicit precision gate against a CPU fp64 reference.
+///
+/// Division of labor: the GPU performs the O(n^2 k) G*V products with tiled fp32
+/// shaders (chunked column blocks so every submitted packet stays under the ~2 s WDDM
+/// TDR budget — see gpu_gram's per-chunk submits); the CPU performs the fp64
+/// Rayleigh quotients and Cholesky-QR orthonormalization between iterations.
+/// \p --validate gates the GPU path against la::topk_eigen on fp64 data (trace within
+/// 1e-5, lambda_1 within 1e-4, tail energies at {0.25,0.5,0.75,1.0} of k within 1e-4)
+/// and exits non-zero if the gate fails; \p --bench just reports wall-clock. The
+/// embedded shaders follow the same resource-state discipline as the production
+/// Device wrapper (explicit COMMON <-> SRV/UAV transitions, no implicit promotion).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -73,19 +86,27 @@ void cs_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
+/// \brief Monotonic steady-clock timestamp in seconds (stage timing).
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
 // Loads a real bf16 2-D tensor as row-major fp32 (m x n), plus an fp64 Gram on CPU.
+/// \brief A real shard tensor loaded for GPU-vs-CPU comparison.
 struct TensorData {
-    size_t m = 0, n = 0;
-    std::vector<float> x32;        // row-major [m, n]
-    std::vector<double> gram64;    // [n, n]
-    std::string name;
+    size_t m = 0, n = 0;         ///< Tensor shape (rows x cols).
+    std::vector<float> x32;      ///< Row-major [m, n] fp32 copy (bf16 widened).
+    std::vector<double> gram64;  ///< [n, n] fp64 CPU Gram of x32, the reference.
+    std::string name;            ///< Tensor name in the shard.
 };
 
+/// \brief Loads one 2-D BF16 tensor from a shard, widens it to fp32 row-major
+///        (parallel over rows), and computes the fp64 CPU Gram as ground truth.
+/// \param shard Safetensors file path.
+/// \param name  Exact tensor name.
+/// \exception std::runtime_error If the tensor is missing or not BF16.
+/// \return Filled TensorData.
 static TensorData load_tensor(const std::string& shard, const std::string& name) {
     sal::st::SafeTensorsFile f{std::filesystem::path(shard)};
     const sal::st::TensorInfo* t = f.find(name);
@@ -108,6 +129,20 @@ static TensorData load_tensor(const std::string& shard, const std::string& name)
 }
 
 // fp32 GPU Gram via chunked syrk dispatches (each < ~2 s).
+/// \brief Computes G = X^T X with the tiled fp32 syrk shader, one chunk of output
+///        columns per submitted packet.
+/// \note TDR discipline: WDDM applies the ~2 s timeout to each submitted packet, so
+///       a single ExecuteCommandLists containing several ~0.5 s dispatches can still
+///       trip it — hence one chunk (default 512 columns) per begin/submit_and_wait.
+///       X is transitioned to NON_PIXEL_SHADER_RESOURCE once up front; G goes
+///       COMMON -> UNORDERED_ACCESS -> COMMON per chunk.
+/// \param dev   Initialized device.
+/// \param syrk  Compiled syrk kernel.
+/// \param x     Row-major [m, n] fp32 input.
+/// \param m,n   Shape of \p x.
+/// \param secs  Optional out: total wall-clock seconds.
+/// \param chunk Output-column block per packet.
+/// \return Row-major [n, n] fp32 Gram, downloaded after the last chunk.
 static std::vector<float> gpu_gram(gpu::Device& dev, gpu::Kernel& syrk, const std::vector<float>& x,
                                    size_t m, size_t n, double* secs = nullptr,
                                    uint32_t chunk = 512) {
@@ -137,6 +172,10 @@ static std::vector<float> gpu_gram(gpu::Device& dev, gpu::Kernel& syrk, const st
 }
 
 // Small-scale syrk correctness check before any big dispatch.
+/// \brief Small-scale syrk correctness gate: 1024x256 Gram vs a double-precision CPU
+///        reference, max abs diff < 1e-2. Runs BEFORE any large dispatch; throws on
+///        failure. Logs \c syrk_selftest.
+/// \exception std::runtime_error If the tolerance is exceeded.
 static void syrk_selftest(gpu::Device& dev, gpu::Kernel& syrk, xlab::Run& run) {
     const size_t m = 1024, n = 256;
     std::mt19937 rng(3);
@@ -158,13 +197,28 @@ static void syrk_selftest(gpu::Device& dev, gpu::Kernel& syrk, xlab::Run& run) {
 }
 
 // Hybrid top-k eigensolver: GPU W=G*V (fp32), CPU Rayleigh + Cholesky QR (fp64 on fp32 data).
+/// \brief Result of the hybrid subspace eigensolver.
 struct Hybrid {
-    std::vector<double> values;
-    std::vector<double> vectors;  // n x k row-major
-    int iters = 0;
-    double gpu_s = 0, cpu_s = 0;
+    std::vector<double> values;   ///< Eigenvalues, descending.
+    std::vector<double> vectors;  ///< n x k row-major eigenvectors, ordered like values.
+    int iters = 0;                ///< Subspace iterations performed (including the final one).
+    double gpu_s = 0, cpu_s = 0;  ///< Cumulative seconds spent on GPU / CPU stages.
 };
 
+/// \brief Hybrid top-k eigensolver for a symmetric [n, n] fp32 matrix: the GPU
+///        computes W = G*V with the tiled NN GEMM shader (512-column chunks, one
+///        packet per chunk under the TDR budget); the CPU computes Rayleigh quotients
+///        and re-orthonormalizes via la::orthonormalize each iteration, converging
+///        when the max eigenvalue change < tol * max(1, lambda_1). V is uploaded
+///        row-major per iteration (Eigen is column-major — converted by index).
+/// \param dev        Initialized device.
+/// \param gemm       Compiled NN GEMM kernel used as the G*V multiply.
+/// \param gf         Row-major [n, n] fp32 matrix (the GPU Gram).
+/// \param n          Matrix edge.
+/// \param k          Subspace width (number of eigenpairs wanted).
+/// \param max_iters  Iteration cap (default 20).
+/// \param tol        Convergence tolerance (default 1e-11).
+/// \return Hybrid result with values sorted descending.
 static Hybrid gpu_topk_eigen(gpu::Device& dev, gpu::Kernel& gemm, const std::vector<float>& gf,
                              size_t n, size_t k, int max_iters = 20, double tol = 1e-11) {
     Hybrid out;
@@ -259,6 +313,12 @@ static Hybrid gpu_topk_eigen(gpu::Device& dev, gpu::Kernel& gemm, const std::vec
     return out;
 }
 
+/// \brief Entry point: parses --validate/--bench (default validate), --shard,
+///        --tensor, --k, --warp; runs the syrk self-test, loads the tensor, computes
+///        GPU + CPU Grams, the CPU fp64 and hybrid GPU top-k solvers, evaluates the
+///        precision gates (trace, lambda_1, tail energies) and logs one
+///        \c gpu_linalg_validate or \c gpu_linalg_bench event.
+/// \return 0 iff gates passed (or in bench mode), 1 on gate failure or fatal error.
 int main(int argc, char** argv) {
     std::string mode = "validate";
     std::string shard = "models/GLM-5.3-Flash/model-00062-of-00062.safetensors";

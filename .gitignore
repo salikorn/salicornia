@@ -22,6 +22,9 @@ extern/directml/*.nuspec
 extern/dml-variants/*.zip
 extern/dml-variants/*.dll
 
+# python bytecode cache (tools/bench_disk.py imports)
+__pycache__/
+
 # editors / os
 .vs/
 .vscode/
