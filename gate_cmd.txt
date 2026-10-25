@@ -1,0 +1,28 @@
+[env] "adapter":"Intel(R) UHD Graphics"
+[gate_gemm_selftest] "gemm_nt_selftest_max_diff":9.537e-07
+[gate_state_probe] "state_roundtrip_max_diff":0.000e+00
+[gate_isolated_gemm1] "isolated_gemm1_max_diff":1.788e-07,"ref_scale":9.608e-01
+[gate_fwd_layer] "layer":"a1","max_abs_diff":1.7881e-07,"scale":9.608e-01
+[gate_fwd_layer] "layer":"h1","max_abs_diff":1.4901e-07,"scale":7.989e-01
+[gate_fwd_layer] "layer":"z","max_abs_diff":2.0862e-07,"scale":4.641e-01
+[gate_fwd_layer] "layer":"a3","max_abs_diff":3.5763e-07,"scale":7.971e-01
+[gate_fwd_layer] "layer":"h3","max_abs_diff":3.2783e-07,"scale":6.275e-01
+[gate_fwd_layer] "layer":"xh","max_abs_diff":3.8743e-07,"scale":6.966e-01
+[gate_gemm_tn_selftest] "gemm_tn_selftest_max_diff":1.907e-06
+[gate_bwd_layer] "grad":"gh3","max_abs_diff":3.6576e-05,"scale":1.841e-05
+[gate_bwd_layer] "grad":"gz","max_abs_diff":2.5466e-11,"scale":4.690e-05
+[gate_bwd_layer] "grad":"gh1_gelu","max_abs_diff":1.0914e-11,"scale":2.372e-05
+[gate_bwd_layer] "grad":"gW4","max_abs_diff":3.2742e-11,"scale":7.894e-05
+[gate_bwd_layer] "grad":"gW3","max_abs_diff":2.5466e-11,"scale":5.411e-05
+[gate_bwd_layer] "grad":"gW2","max_abs_diff":8.7311e-11,"scale":1.467e-04
+[gate_bwd_layer] "grad":"gW1","max_abs_diff":3.2742e-11,"scale":5.482e-05
+[gate_param] "param":"W1","frob_rel":2.920e-07
+[gate_param] "param":"W2","frob_rel":4.347e-07
+[gate_param] "param":"W3","frob_rel":1.256e-07
+[gate_param] "param":"W4","frob_rel":2.987e-07
+[gpu_trainer_gate] "max_param_frob_rel":4.347e-07
+CK0: constructing gv
+CK1: gv constructed
+CK2: bX uploaded
+CK3: cb downloaded
+CK4: cpu fwd ref done

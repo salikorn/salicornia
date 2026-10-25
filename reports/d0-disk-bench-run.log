@@ -1,0 +1,64 @@
+python 3.14.3, 12 logical CPUs
+
+[a] sequential large-read throughput on C:\Users\salistellix\Desktop\salikorn\models\GLM-5.3-Flash\model-00062-of-00062.safetensors
+    file size: 1,261,584,968 bytes (1.262 GB decimal)
+  seq cold-ish 8MB: 1,261,584,968 bytes in    0.552s ->   2287.5 MB/s (  2181.6 MiB/s)
+  seq cold-ish 64MB: 1,261,584,968 bytes in    0.520s ->   2424.6 MB/s (  2312.3 MiB/s)
+  seq  warm 8MB: 1,261,584,968 bytes in    0.482s ->   2616.2 MB/s (  2495.0 MiB/s)
+  seq warm 32MB: 1,261,584,968 bytes in    0.555s ->   2275.1 MB/s (  2169.7 MiB/s)
+  seq warm 64MB: 1,261,584,968 bytes in    0.528s ->   2388.2 MB/s (  2277.6 MiB/s)
+
+[b] 4KB random-read throughput over a 1 GB window
+    20,000 x 4KB reads, 81,920,000 bytes in 0.527s -> 155.30 MB/s (37,915 IOPS)
+
+[pass estimate] one full 328 GB model pass at measured seq rates
+   cold-ish 8MB:   2287.5 MB/s ->     2.4 min
+  cold-ish 64MB:   2424.6 MB/s ->     2.3 min
+       warm 8MB:   2616.2 MB/s ->     2.1 min
+      warm 32MB:   2275.1 MB/s ->     2.4 min
+      warm 64MB:   2388.2 MB/s ->     2.3 min
+
+JSON:
+{
+  "seq": {
+    "cold-ish 8MB": {
+      "dt": 0.551506399999198,
+      "bytes": 1261584968,
+      "MBps": 2287.52552645234
+    },
+    "cold-ish 64MB": {
+      "dt": 0.5203242000061437,
+      "bytes": 1261584968,
+      "MBps": 2424.6132853038625
+    },
+    "warm 8MB": {
+      "dt": 0.4822268999996595,
+      "bytes": 1261584968,
+      "MBps": 2616.164647805609
+    },
+    "warm 32MB": {
+      "dt": 0.5545233000011649,
+      "bytes": 1261584968,
+      "MBps": 2275.0801778705236
+    },
+    "warm 64MB": {
+      "dt": 0.528250700001081,
+      "bytes": 1261584968,
+      "MBps": 2388.2315120404355
+    }
+  },
+  "random4k": {
+    "MBps": 155.2989609260075,
+    "iops": 37914.78538232605,
+    "dt": 0.5274987000011606,
+    "bytes": 81920000,
+    "n_reads": 20000
+  },
+  "pass328GB_min": {
+    "cold-ish 8MB": 2.3897729679741624,
+    "cold-ish 64MB": 2.254655082441966,
+    "warm 8MB": 2.089572868149566,
+    "warm 32MB": 2.402845719390633,
+    "warm 64MB": 2.2890019828923984
+  }
+}

@@ -1,0 +1,29 @@
+# builds / runs / heavy local state
+build/
+runs/
+cache/
+shards/
+models/
+profiles/
+reports/generated/
+
+# vendored DirectML binaries are fetched by tools/fetch_deps.sh, not committed
+extern/directml.zip
+extern/directml/bin/
+extern/directml/build/
+extern/directml/package/
+extern/directml/_rels/
+extern/directml/[Content_Types].xml
+extern/directml/*.md
+extern/directml/*.txt
+extern/directml/*.nuspec
+
+# fetched DirectML variant binaries — same rule as extern/directml above
+extern/dml-variants/*.zip
+extern/dml-variants/*.dll
+
+# editors / os
+.vs/
+.vscode/
+.idea/
+Thumbs.db
